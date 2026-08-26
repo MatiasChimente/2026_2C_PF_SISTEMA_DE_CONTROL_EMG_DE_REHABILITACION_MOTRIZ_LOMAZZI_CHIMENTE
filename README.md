@@ -71,7 +71,7 @@ Donde:
 **Carrera:** Ingeniería Mecatrónica  
 **Materia / Curso:** Proyecto en ingeniería mecatrónica  
 **Docente / Cátedra:** Ezequiel, Blanca · Cristian, Lukaszewicz · Juan Ignacio, Szombach 
-**Autor/es:** LOMAZZI, Bianca — [Legajo] · CHIMENTE, Matias — [Legajo]
+**Autor/es:** LOMAZZI, Bianca — 44650286 · CHIMENTE, Matias — 44709249
 
 ---
 
@@ -133,10 +133,10 @@ Se implementa con **microcontroladores ESP32, sensores MyoWare e impresión 3D**
 
 ### Alcance
 **Incluye:**
-- [X] Desarrollo de manga auxética ajustable pasiva con electrodos.
-- [X] Unidad de control central desmontable con Super Mini ESP32 y batería LiPo.
-- [X] Vehículo robótico con sensor de proximidad y carrocerías 3D.
-- [X] Aplicación web "Robrain Kids" para interacción y registro de progreso.
+- [1] Desarrollo de manga auxética ajustable pasiva con electrodos.
+- [2] Unidad de control central desmontable con Super Mini ESP32 y batería LiPo.
+- [3] Vehículo robótico con sensor de proximidad y carrocerías 3D.
+- [4] Aplicación web "Robrain Kids" para interacción y registro de progreso.
 
 **No incluye (por ahora):**
 - [A]
@@ -250,9 +250,10 @@ El sistema se compone de una unidad wearable equipada con un sensor MyoWare que 
 ---
 
 ## Autor
-**[LOMAZZI, Bianca]** — [Legajo]  
-**[CHIMENTE, Matias]** — [Legajo]  
+**[LOMAZZI, Bianca]** — [44650286]  
+**[CHIMENTE, Matias]** — [44709249]  
 Contacto (opcional): [biancalujan58@gmail.com / [LinkedIn](https://www.linkedin.com/in/biancalomazzi/)]
+
 Contacto (opcional): [matias.chimente@gmail.com / [LinkedIn](https://www.linkedin.com/in/matias-chimente/)]
 
 ---

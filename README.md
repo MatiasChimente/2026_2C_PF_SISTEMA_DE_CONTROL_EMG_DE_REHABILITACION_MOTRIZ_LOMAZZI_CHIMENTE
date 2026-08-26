@@ -52,7 +52,7 @@ Donde:
 ---
 
 ## ✅ Checklist de entrega
-- [ ] Naming correcto del repo: `ANIO_CUATRIMESTRE_TIPO_PROYECTO_APELLIDOS`
+- [X] Naming correcto del repo: `ANIO_CUATRIMESTRE_TIPO_PROYECTO_APELLIDOS`
 - [ ] Título, autores, materia, **tipo (PPS/PF)**, año y cuatrimestre completos
 - [ ] Brief completo (one-liner + pitch + problema + solución + alcance + estado)
 - [ ] Instrucciones de uso reproducibles (otro puede correrlo)
@@ -63,33 +63,33 @@ Donde:
 
 ---
 
-# [TÍTULO DEL PROYECTO]
+# Sistema de control wearable mediante señales EMG para rehabilitación motriz
 
-**Tipo:** [PPS | PF]  
-**Año:** [2026] — **Cuatrimestre:** [1C | 2C]  
+**Tipo:** PF  
+**Año:** 2026 — **Cuatrimestre:** 2C  
 
 **Carrera:** Ingeniería Mecatrónica  
-**Materia / Curso:** [NOMBRE_DE_LA_MATERIA]  
-**Docente / Cátedra:** [NOMBRE_DOCENTE]  
-**Autor/es:** [APELLIDO, Nombre — Legajo] · [APELLIDO, Nombre — Legajo]
+**Materia / Curso:** Proyecto en ingeniería mecatrónica  
+**Docente / Cátedra:** Ezequiel, Blanca · Cristian, Lukaszewicz · Juan Ignacio, Szombach 
+**Autor/es:** LOMAZZI, Bianca — [Legajo] · CHIMENTE, Matias — [Legajo]
 
 ---
 
 ## Introducción / Objetivo
 
 **Contexto (2–4 líneas):**  
-[Describir contexto general y necesidad.]
+El proyecto se enfoca en personas que presentan limitaciones en la movilidad de las extremidades superiores. Busca introducir una solución tecnológica y accesible en los entornos de rehabilitación física para asistir tanto a pacientes como a profesionales de la salud.
 
 **Problema a resolver:**  
-[Describir el problema de forma concreta.]
+La necesidad de potenciar y asistir los procesos de rehabilitación física convencionales mediante herramientas interactivas que aumenten la motivación y adherencia al tratamiento.
 
 **Objetivo general:**  
-[Qué logra el sistema.]
+Desarrollar un sistema integrado que combine hardware wearable, procesamiento de señales biomédicas y software interactivo para asistir la rehabilitación motriz.
 
 **Objetivos específicos (opcional):**
-- [Objetivo 1]
-- [Objetivo 2]
-- [Objetivo 3]
+- Capturar e interpretar impulsos eléctricos generados por la contracción muscular utilizando sensores EMG integrados en una manga auxética.
+- Traducir las intenciones de movimiento en comandos inalámbricos para controlar un vehículo robótico.
+- Proveer una plataforma web interactiva y lúdica ("Robrain Kids") que estimule al paciente y permita registrar indicadores de desempeño para el seguimiento médico.
 
 ---
 
@@ -111,37 +111,39 @@ Donde:
 ## Brief
 
 **One-liner (1 frase):**  
-[Qué hace el proyecto + para quién + beneficio principal.]
+Sistema wearable basado en señales EMG que permite a pacientes en rehabilitación controlar un vehículo robótico y juegos interactivos para potenciar su recuperación física.
 
 **Elevator pitch (30 segundos):**  
-Este proyecto **[nombre del proyecto]** (tipo **[PPS/PF]**, **[AÑO] [CUATRIMESTRE]**) resuelve **[problema]** mediante **[solución]**.  
-Está orientado a **[público objetivo]** y permite **[beneficio medible]**.  
-Se implementa con **[tecnologías clave]** y se valida mediante **[pruebas/mediciones/demo]**.
+Este proyecto **Sistema de control wearable EMG** (tipo **PF**, **2026 2C**) resuelve **la falta de motivación y seguimiento en las terapias motrices** mediante **una manga con sensores electromiográficos conectada a un vehículo robótico y un entorno virtual gamificado.**.  
+Está orientado a **personas y niños con limitaciones de movilidad en extremidades superiores** y permite **realizar un seguimiento objetivo de la evolución terapéutica.**  
+Se implementa con **microcontroladores ESP32, sensores MyoWare e impresión 3D** y se valida mediante **el control efectivo del actuador y la interacción con la aplicación web.**.
 
 ### Problema
-- **Contexto:** [laboratorio / industria / hogar / aula / etc.]
+- **Contexto:** Entornos clínicos u hogareños de rehabilitación física, especialmente aquellos que tratan a niños y niñas.
 - **Dolor principal:** [qué falla / qué es lento / qué es costoso / qué es riesgoso]
 - **Impacto:** [tiempo, costo, errores, seguridad, calidad]
 
 ### Solución propuesta
 - **Qué hace (features):**
-  - [Funcionalidad 1]
-  - [Funcionalidad 2]
-  - [Funcionalidad 3]
-- **Cómo lo hace (alto nivel):** [sensor → control → actuador → visualización]
-- **Valor diferencial:** [por qué es mejor / distinto]
+  - Captura señales electromiográficas (EMG) adaptándose a la anatomía del brazo mediante una estructura auxética.
+  - Controla de forma inalámbrica un vehículo robótico con mecanismo de prevención de colisiones.
+  - Ofrece actividades lúdicas (ej. "Estallido de Globos", "Estrella de Rock") en la aplicación web "Robrain Kids".
+- **Cómo lo hace (alto nivel):** Sensor EMG MyoWare → Unidad de control ESP32 → Transmisión inalámbrica → Vehículo robótico / Interfaz Web.
+- **Valor diferencial:** Su portabilidad extrema por el diseño desmontable, el bajo consumo energético, la adaptabilidad de la manga impresa en 3D y su enfoque gamificado.
 
 ### Alcance
 **Incluye:**
-- [X]
-- [Y]
+- [X] Desarrollo de manga auxética ajustable pasiva con electrodos.
+- [X] Unidad de control central desmontable con Super Mini ESP32 y batería LiPo.
+- [X] Vehículo robótico con sensor de proximidad y carrocerías 3D.
+- [X] Aplicación web "Robrain Kids" para interacción y registro de progreso.
 
 **No incluye (por ahora):**
 - [A]
 - [B]
 
 ### Estado del proyecto
-- **Madurez:** [idea / prototipo / MVP / validado]
+- **Madurez:** Prototipo
 - **Qué funciona hoy:** [lista corta]
 - **Próximos pasos:** [lista corta]
 
@@ -155,25 +157,25 @@ Se implementa con **[tecnologías clave]** y se valida mediante **[pruebas/medic
 ---
 
 ## Descripción técnica
-[Explicación técnica del funcionamiento, decisiones de diseño y consideraciones.]
+El sistema se compone de una unidad wearable equipada con un sensor MyoWare que capta los impulsos de contracción muscular. Esta señal ingresa a una unidad central comandada por un ESP32 C3 Super Mini, alimentado por una batería LiPo de 3.7V (600mAh). Las señales procesadas son enviadas inalámbricamente para comandar tanto las acciones de un vehículo robótico (equipado con parada de emergencia por proximidad) como los eventos dentro del software web "Robrain Kids". El hardware se integra a la piel del usuario a través de una manga con geometría auxética impresa en 3D.
 
 ---
 
 ## Arquitectura del sistema
 
 **Entradas (sensores / señales):**
-- [Sensor 1]
-- [Sensor 2]
+- Sensor Electromiográfico (MyoWare)
+- Sensor de proximidad (para detección de obstáculos)
 
 **Procesamiento / Control:**
-- [Microcontrolador / PC / algoritmo / lógica]
+- Microcontrolador ESP32 C3 Super Mini
+- Plataforma web para el registro de indicadores de desempeño
 
 **Salidas (actuadores / señales):**
-- [Actuador 1]
-- [Actuador 2]
+- Sistema de actuación del vehículo robótico (motores)
 
 **Interfaz (si aplica):**
-- [Pantalla / dashboard / app / web]
+- Aplicación web "Robrain Kids" (dashboard interactivo de rehabilitación)
 
 > (Opcional) Insertar diagrama:
 ![Diagrama de bloques](PLANOS/diagrama_bloques.png)
@@ -205,9 +207,9 @@ Se implementa con **[tecnologías clave]** y se valida mediante **[pruebas/medic
 ---
 
 ## Tecnologías utilizadas
-- **Robótica / Control:** [Arduino / ESP32 / Raspberry / etc.]
-- **Electrónica:** [sensores / drivers / etc.]
-- **Programación:** [C/C++ / Python / etc.]
+- **Robótica / Control:** ESP32 C3 Super Mini, ESP32
+- **Electrónica:** Sensor MyoWare, Batería LiPo 3.7V 600mAh, Sensores de proximidad.
+- **Programación:** C, Python.
 - **Plataformas / Tools:** [ROS / OpenCV / etc.]
 - **IA (si aplica):** [modelo / técnica]
 
@@ -217,9 +219,11 @@ Se implementa con **[tecnologías clave]** y se valida mediante **[pruebas/medic
 
 | Componente | Cantidad | Modelo / Especificación | Función |
 |---|---:|---|---|
-| [Componente 1] | [1] | [Modelo] | [Función] |
-| [Componente 2] | [2] | [Modelo] | [Función] |
-| [Componente 3] | [1] | [Modelo] | [Función] |
+| Sensor EMG | [2] | [Modelo] | [Función] |
+| Microcontrolador | [2] | ESP 32 C3 Super Mini | [Función] |
+| Microcontrolador | [1] | ESP 32 | [Función] |
+| Bateria | [2] | LiPo 3.7 V 600 mAh | [Función] |
+| Soporte wearable | [2] | Manga auxética 3D | [Función] |
 
 ---
 
@@ -246,8 +250,10 @@ Se implementa con **[tecnologías clave]** y se valida mediante **[pruebas/medic
 ---
 
 ## Autor
-**[APELLIDO, Nombre]** — [Legajo]  
-Contacto (opcional): [mail / LinkedIn]
+**[LOMAZZI, Bianca]** — [Legajo]  
+**[CHIMENTE, Matias]** — [Legajo]  
+Contacto (opcional): [biancalujan58@gmail.com / [LinkedIn](https://www.linkedin.com/in/biancalomazzi/)]
+Contacto (opcional): [matias.chimente@gmail.com / [LinkedIn](https://www.linkedin.com/in/matias-chimente/)]
 
 ---
 
@@ -258,6 +264,6 @@ Contacto (opcional): [mail / LinkedIn]
 
 ## About (descripción corta del repositorio)
 
-Usar este texto (o similar) en el campo **About** de GitHub:
+El presente proyecto consiste en el diseño y desarrollo de un sistema integrado orientado a la rehabilitación motriz de personas con limitaciones en la movilidad de las extremidades superiores.
 
-**[PPS | PF] — [Proyecto] — FI-UNLZ — [2026] [1C|2C] — [Apellido1, Apellido2]**
+**PF — SISTEMA DE CONTROL EMG DE REHABILITACION MOTRIZ — FI-UNLZ — 2026 2C — Lomazzi, Chimente**

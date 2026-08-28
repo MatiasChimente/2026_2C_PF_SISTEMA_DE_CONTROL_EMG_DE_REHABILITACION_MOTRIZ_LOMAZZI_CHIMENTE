@@ -53,8 +53,8 @@ Donde:
 
 ## ✅ Checklist de entrega
 - [X] Naming correcto del repo: `ANIO_CUATRIMESTRE_TIPO_PROYECTO_APELLIDOS`
-- [ ] Título, autores, materia, **tipo (PPS/PF)**, año y cuatrimestre completos
-- [ ] Brief completo (one-liner + pitch + problema + solución + alcance + estado)
+- [X] Título, autores, materia, **tipo (PPS/PF)**, año y cuatrimestre completos
+- [X] Brief completo (one-liner + pitch + problema + solución + alcance + estado)
 - [ ] Instrucciones de uso reproducibles (otro puede correrlo)
 - [ ] Lista de componentes con cantidades y modelos
 - [ ] Esquemáticos/planos adjuntos en `PLANOS/`
@@ -139,13 +139,13 @@ Se implementa con **microcontroladores ESP32, sensores MyoWare e impresión 3D**
 - [4] Aplicación web "Robrain Kids" para interacción y registro de progreso.
 
 **No incluye (por ahora):**
-- [A]
-- [B]
+- [A] Certificación médica de grado clínico.
+- [B] Doc de carga.
 
 ### Estado del proyecto
 - **Madurez:** Prototipo
-- **Qué funciona hoy:** [lista corta]
-- **Próximos pasos:** [lista corta]
+- **Qué funciona hoy:** Diseño de la unidad de control, lectura del sensor MyoWare, interfaz de usuario web "Robrain Kids".
+- **Próximos pasos:** Desarrollo e implementación de un dock de carga para la unidad central, Rediseño y desarrollo del vehículo robótico.
 
 ### Demo rápida
 - **Video / GIF:** [link o ruta en MULTIMEDIA]

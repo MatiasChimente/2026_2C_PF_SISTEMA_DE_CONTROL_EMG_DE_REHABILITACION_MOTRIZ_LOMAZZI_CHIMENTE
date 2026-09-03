@@ -1,0 +1,2319 @@
+
+
+//*********************************************************** CODIGO BRAZO DERECHO *************************************************************************
+//*************************************************************************************************************************************************************
+//************************************************************************************************************************************************************
+
+
+
+
+
+
+//
+[env:esp32c3]
+platform = espressif32
+board = esp32-c3-devkitm-1
+framework = arduino
+monitor_speed = 115200
+board_build.partitions = min_spiffs.csv
+//
+
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+/* ══════════════════════════════════════════════════════════
+   ROBRAIN KIDS — SENSOR EMG BRAZO DERECHO (ESP32-C3 SUPER MINI)
+   - Detector de envolvente pico a pico para señal EMG real
+   - Umbral por defecto 800 (ajustable via SET_TH desde la web)
+   - BLE GATT Server para Web + ESP-NOW Directo al auto
+══════════════════════════════════════════════════════════ */
+
+#define DEVICE_NAME         "Robrain-EMG-R"
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+#define PIN_EMG      0
+#define WIFI_CHANNEL 1
+
+typedef struct __attribute__((packed)) struct_emg_msg {
+  char arm;
+  uint8_t active;
+  uint16_t raw;
+  uint32_t seq;
+} struct_emg_msg;
+
+struct_emg_msg emgData;
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+BLEServer* pServer = NULL;
+BLECharacteristic* pCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+int threshold = 800;        // Bajado de 1500 a 800 — compatible con el nuevo algoritmo
+bool autoModeEnabled = false;
+uint32_t packetSeq = 0;
+
+float filteredValue = 0.0;
+const float filterAlpha = 0.35;
+
+unsigned long lastEspNowSend = 0;
+unsigned long lastBleNotify = 0;
+
+class ServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println("[BLE] Web conectada a Brazo Derecho");
+  }
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("[BLE] Web desconectada");
+  }
+};
+
+class CharCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pChar) {
+    String rxValue = pChar->getValue().c_str();
+    if (rxValue.length() > 0) {
+      if (rxValue.startsWith("SET_TH:")) {
+        threshold = rxValue.substring(7).toInt();
+        Serial.printf("[CONFIG] Nuevo umbral Derecho: %d\n", threshold);
+      }
+      else if (rxValue == "MODE:AUTO") {
+        autoModeEnabled = true;
+        Serial.println("[MODO] Activado MODO AUTO (ESP-NOW)");
+      }
+      else if (rxValue == "MODE:GAMES") {
+        autoModeEnabled = false;
+        Serial.println("[MODO] Activado MODO JUEGOS");
+      }
+    }
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+  pinMode(PIN_EMG, INPUT);
+
+  // Inicializar filtro con valor real del ADC para evitar arranque falso
+  filteredValue = analogRead(PIN_EMG);
+
+  // 1. Configuración Wi-Fi optimizada para ESP32-C3 Super Mini
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  WiFi.setTxPower(WIFI_POWER_11dBm);
+
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  // Inicializar ESP-NOW
+  if (esp_now_init() == ESP_OK) {
+    Serial.println("[ESP-NOW] Inicializado en Canal 1");
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.channel = WIFI_CHANNEL;
+    peerInfo.encrypt = false;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.println("[ESP-NOW] Error al agregar peer broadcast");
+    }
+  }
+
+  // 2. Inicializar BLE
+  BLEDevice::init(DEVICE_NAME);
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ   |
+    BLECharacteristic::PROPERTY_WRITE  |
+    BLECharacteristic::PROPERTY_WRITE_NR |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pCharacteristic->addDescriptor(new BLE2902());
+  pCharacteristic->setCallbacks(new CharCallbacks());
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  BLEDevice::startAdvertising();
+
+  Serial.println("[STATUS] Robrain-EMG-R con algoritmo pico a pico listo.");
+}
+
+void loop() {
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(200);
+    pServer->startAdvertising();
+    oldDeviceConnected = deviceConnected;
+  }
+  if (deviceConnected && !oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+  }
+
+  // 1. RÁFAGA RÁPIDA: 30 muestras para detectar la oscilación muscular real
+  int minVal = 4095;
+  int maxVal = 0;
+  for (int i = 0; i < 20; i++) {
+    int sample = analogRead(PIN_EMG);
+    if (sample < minVal) minVal = sample;
+    if (sample > maxVal) maxVal = sample;
+    delayMicroseconds(250); // Muestreo a ~4 kHz
+  }
+
+  // 2. Amplitud pico a pico — elimina la línea base y mide la fuerza real
+  int amplitud = maxVal - minVal;
+
+  // 3. Ganancia digital — amplifica para tener rango claro 0-3000
+  int gananciaDigital = 4;
+  int fuerzaCalculada = amplitud * gananciaDigital;
+
+  // 4. Suavizado con filtro de media móvil
+  filteredValue = (filterAlpha * fuerzaCalculada) + ((1.0 - filterAlpha) * filteredValue);
+  uint16_t cleanValue = (uint16_t)filteredValue;
+  bool isContracted = (cleanValue >= threshold);
+
+  // 5. Notificación BLE (25 Hz)
+  if (deviceConnected && (millis() - lastBleNotify >= 40)) {
+    lastBleNotify = millis();
+    char strVal[12];
+    sprintf(strVal, "%d", cleanValue);
+    pCharacteristic->setValue(strVal);
+    pCharacteristic->notify();
+  }
+
+  // 6. Transmisión ESP-NOW al auto (35 Hz)
+  if (autoModeEnabled && (millis() - lastEspNowSend >= 28)) {
+    lastEspNowSend = millis();
+    emgData.arm    = 'R';
+    emgData.active = isContracted ? 1 : 0;
+    emgData.raw    = cleanValue;
+    emgData.seq    = packetSeq++;
+    esp_now_send(broadcastAddress, (uint8_t *)&emgData, sizeof(emgData));
+
+    Serial.printf("[EMG-R] Amplitud:%d Fuerza:%d Umbral:%d Activo:%d\n",
+                  amplitud, cleanValue, threshold, emgData.active);
+  }
+
+  delay(5);
+}
+
+
+
+
+
+
+//*********************************************************** CODIGO BRAZO IZQUIERDO *************************************************************************
+//*************************************************************************************************************************************************************
+//************************************************************************************************************************************************************
+
+
+
+
+
+
+
+
+[env:esp32c3]
+platform = espressif32
+board = esp32-c3-devkitm-1
+framework = arduino
+monitor_speed = 115200
+board_build.partitions = min_spiffs.csv
+//
+
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+/* ══════════════════════════════════════════════════════════
+   ROBRAIN KIDS — SENSOR EMG BRAZO IZQUIERDO (ESP32-C3 SUPER MINI)
+   - Detector de envolvente pico a pico para señal EMG real
+   - Umbral por defecto 800 (ajustable via SET_TH desde la web)
+   - BLE GATT Server para Web + ESP-NOW Directo al auto
+══════════════════════════════════════════════════════════ */
+
+#define DEVICE_NAME         "Robrain-EMG-L"
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+#define PIN_EMG      3
+#define WIFI_CHANNEL 1
+
+typedef struct __attribute__((packed)) struct_emg_msg {
+  char arm;
+  uint8_t active;
+  uint16_t raw;
+  uint32_t seq;
+} struct_emg_msg;
+
+struct_emg_msg emgData;
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+BLEServer* pServer = NULL;
+BLECharacteristic* pCharacteristic = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+
+int threshold = 800;        // Bajado de 1500 a 800 — compatible con el nuevo algoritmo
+bool autoModeEnabled = false;
+uint32_t packetSeq = 0;
+
+float filteredValue = 0.0;
+const float filterAlpha = 0.35;
+
+unsigned long lastEspNowSend = 0;
+unsigned long lastBleNotify = 0;
+
+class ServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println("[BLE] Web conectada a Brazo Izquierdo");
+  }
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("[BLE] Web desconectada");
+  }
+};
+
+class CharCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pChar) {
+    String rxValue = pChar->getValue().c_str();
+    if (rxValue.length() > 0) {
+      if (rxValue.startsWith("SET_TH:")) {
+        threshold = rxValue.substring(7).toInt();
+        Serial.printf("[CONFIG] Nuevo umbral Izquierdo: %d\n", threshold);
+      }
+      else if (rxValue == "MODE:AUTO") {
+        autoModeEnabled = true;
+        Serial.println("[MODO] Activado MODO AUTO (ESP-NOW)");
+      }
+      else if (rxValue == "MODE:GAMES") {
+        autoModeEnabled = false;
+        Serial.println("[MODO] Activado MODO JUEGOS");
+      }
+    }
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+  analogReadResolution(12);
+  pinMode(PIN_EMG, INPUT);
+
+  // Inicializar filtro con valor real del ADC para evitar arranque falso
+  filteredValue = analogRead(PIN_EMG);
+
+  // 1. Configuración Wi-Fi optimizada para ESP32-C3 Super Mini
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  WiFi.setTxPower(WIFI_POWER_11dBm);
+
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  // Inicializar ESP-NOW
+  if (esp_now_init() == ESP_OK) {
+    Serial.println("[ESP-NOW] Inicializado en Canal 1");
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.channel = WIFI_CHANNEL;
+    peerInfo.encrypt = false;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+      Serial.println("[ESP-NOW] Error al agregar peer broadcast");
+    }
+  }
+
+  // 2. Inicializar BLE
+  BLEDevice::init(DEVICE_NAME);
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ   |
+    BLECharacteristic::PROPERTY_WRITE  |
+    BLECharacteristic::PROPERTY_WRITE_NR |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pCharacteristic->addDescriptor(new BLE2902());
+  pCharacteristic->setCallbacks(new CharCallbacks());
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  BLEDevice::startAdvertising();
+
+  Serial.println("[STATUS] Robrain-EMG-L con algoritmo pico a pico listo.");
+}
+
+void loop() {
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(200);
+    pServer->startAdvertising();
+    oldDeviceConnected = deviceConnected;
+  }
+  if (deviceConnected && !oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+  }
+
+  // 1. RÁFAGA RÁPIDA: 30 muestras para detectar la oscilación muscular real
+  int minVal = 4095;
+  int maxVal = 0;
+  for (int i = 0; i < 20; i++) {
+    int sample = analogRead(PIN_EMG);
+    if (sample < minVal) minVal = sample;
+    if (sample > maxVal) maxVal = sample;
+    delayMicroseconds(250); // Muestreo a ~4 kHz
+  }
+
+  // 2. Amplitud pico a pico — elimina la línea base y mide la fuerza real
+  int amplitud = maxVal - minVal;
+
+  // 3. Ganancia digital — amplifica para tener rango claro 0-3000
+  int gananciaDigital = 4;
+  int fuerzaCalculada = amplitud * gananciaDigital;
+
+  // 4. Suavizado con filtro de media móvil
+  filteredValue = (filterAlpha * fuerzaCalculada) + ((1.0 - filterAlpha) * filteredValue);
+  uint16_t cleanValue = (uint16_t)filteredValue;
+  bool isContracted = (cleanValue >= threshold);
+
+  // 5. Notificación BLE (25 Hz)
+  if (deviceConnected && (millis() - lastBleNotify >= 40)) {
+    lastBleNotify = millis();
+    char strVal[12];
+    sprintf(strVal, "%d", cleanValue);
+    pCharacteristic->setValue(strVal);
+    pCharacteristic->notify();
+  }
+
+  // 6. Transmisión ESP-NOW al auto (35 Hz)
+  if (autoModeEnabled && (millis() - lastEspNowSend >= 28)) {
+    lastEspNowSend = millis();
+    emgData.arm    = 'L';
+    emgData.active = isContracted ? 1 : 0;
+    emgData.raw    = cleanValue;
+    emgData.seq    = packetSeq++;
+    esp_now_send(broadcastAddress, (uint8_t *)&emgData, sizeof(emgData));
+
+    Serial.printf("[EMG-L] Amplitud:%d Fuerza:%d Umbral:%d Activo:%d\n",
+                  amplitud, cleanValue, threshold, emgData.active);
+  }
+
+  delay(5);
+}
+
+
+
+
+
+
+//*********************************************************** CODIGO ESP32 AUTO *************************************************************************
+//*************************************************************************************************************************************************************
+//************************************************************************************************************************************************************
+
+
+
+
+
+
+// 
+[env:esp32dev]
+platform = espressif32
+board = esp32dev
+framework = arduino
+board_build.partitions = min_spiffs.csv
+//
+
+
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
+/* ══════════════════════════════════════════════════════════
+   ROBRAIN KIDS — CONTROLADOR DEL AUTO (ESP32 NORMAL)
+   - Receptor ESP-NOW en Canal 1 sincronizado (<2ms latencia)
+   - Servidor BLE GATT
+   - Control de Puente H (L298N / DRV8833)
+══════════════════════════════════════════════════════════ */
+
+#define DEVICE_NAME         "Robrain-Car"
+#define SERVICE_UUID        "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define CHARACTERISTIC_UUID "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+
+#define PIN_IN1 12 
+#define PIN_IN2 13
+#define PIN_IN3 14
+#define PIN_IN4 27
+
+#define WIFI_CHANNEL 1
+
+typedef struct __attribute__((packed)) struct_emg_msg {
+  char arm;        // 'L' o 'R'
+  uint8_t active;  // 1 = activado, 0 = reposo
+  uint16_t raw;    // valor analógico
+  uint32_t seq;
+} struct_emg_msg;
+
+struct_emg_msg incomingData;
+
+volatile bool leftActive = false;
+volatile bool rightActive = false;
+volatile unsigned long lastLeftPacket = 0;
+volatile unsigned long lastRightPacket = 0;
+
+BLEServer* pServer = NULL;
+bool deviceConnected = false;
+bool oldDeviceConnected = false;
+String lastBleCmd = "STOP";
+unsigned long lastBleTime = 0;
+
+void ejecutarMotores(String cmd) {
+  static String currentCmd = "";
+  if (cmd == currentCmd) return;
+  currentCmd = cmd;
+
+  if (cmd == "FORWARD") {
+    digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);
+    digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);
+    Serial.println("[AUTO] ▲ AVANZAR (Ambos brazos)");
+  } 
+  else if (cmd == "BACK") {
+    digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, HIGH);
+    digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, HIGH);
+    Serial.println("[AUTO] ▼ RETROCEDER");
+  } 
+  else if (cmd == "LEFT") {
+    digitalWrite(PIN_IN1, LOW);  digitalWrite(PIN_IN2, LOW);
+    digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);
+    Serial.println("[AUTO] ◄ GIRAR IZQUIERDA (Brazo Izq)");
+  } 
+  else if (cmd == "RIGHT") {
+    digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);
+    digitalWrite(PIN_IN3, LOW);  digitalWrite(PIN_IN4, LOW);
+    Serial.println("[AUTO] ► GIRAR DERECHA (Brazo Der)");
+  } 
+  else {
+    digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, LOW);
+    digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, LOW);
+    Serial.println("[AUTO] ■ DETENIDO");
+  }
+}
+
+void OnDataRecv(const uint8_t * mac, const uint8_t *data, int len) {
+  if (len == sizeof(struct_emg_msg)) {
+    memcpy(&incomingData, data, sizeof(incomingData));
+    
+    if (incomingData.arm == 'L') {
+      leftActive = (incomingData.active == 1);
+      lastLeftPacket = millis();
+    } 
+    else if (incomingData.arm == 'R') {
+      rightActive = (incomingData.active == 1);
+      lastRightPacket = millis();
+    }
+  }
+}
+
+class ServerCallbacks: public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    deviceConnected = true;
+    Serial.println("[BLE] Web conectada al Auto");
+  }
+  void onDisconnect(BLEServer* pServer) {
+    deviceConnected = false;
+    Serial.println("[BLE] Web desconectada del Auto");
+    ejecutarMotores("STOP");
+  }
+};
+
+class CharCallbacks: public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pChar) {
+    String rxValue = pChar->getValue().c_str();
+    if (rxValue.length() > 0) {
+      lastBleCmd = rxValue;
+      lastBleTime = millis();
+      ejecutarMotores(rxValue);
+    }
+  }
+};
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_IN1, OUTPUT); pinMode(PIN_IN2, OUTPUT);
+  pinMode(PIN_IN3, OUTPUT); pinMode(PIN_IN4, OUTPUT);
+  ejecutarMotores("STOP");
+
+  // 1. Inicializar Wi-Fi y fijar Canal 1
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+  if (esp_now_init() == ESP_OK) {
+    Serial.println("[ESP-NOW] Receptor inicializado en Canal 1");
+    esp_now_register_recv_cb(OnDataRecv);
+  } else {
+    Serial.println("[ESP-NOW] Error al inicializar");
+  }
+
+  // 2. Inicializar Servidor BLE
+  BLEDevice::init(DEVICE_NAME);
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new ServerCallbacks());
+
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+                                         CHARACTERISTIC_UUID,
+                                         BLECharacteristic::PROPERTY_READ   |
+                                         BLECharacteristic::PROPERTY_WRITE  |
+                                         BLECharacteristic::PROPERTY_WRITE_NR
+                                       );
+
+  pCharacteristic->addDescriptor(new BLE2902());
+  pCharacteristic->setCallbacks(new CharCallbacks());
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  BLEDevice::startAdvertising();
+
+  Serial.println("[STATUS] Robrain-Car listo en Canal 1.");
+}
+
+void loop() {
+  if (!deviceConnected && oldDeviceConnected) {
+    delay(200);
+    pServer->startAdvertising();
+    oldDeviceConnected = deviceConnected;
+  }
+  if (deviceConnected && !oldDeviceConnected) {
+    oldDeviceConnected = deviceConnected;
+  }
+
+  unsigned long now = millis();
+
+  // Deadman Switch: Freno de seguridad automático
+  if (now - lastLeftPacket > 250)  leftActive = false;
+  if (now - lastRightPacket > 250) rightActive = false;
+
+  bool recentEspNow = (now - lastLeftPacket < 500) || (now - lastRightPacket < 500);
+
+  if (recentEspNow) {
+    if (leftActive && rightActive) {
+      ejecutarMotores("FORWARD");
+    } else if (leftActive) {
+      ejecutarMotores("LEFT");
+    } else if (rightActive) {
+      ejecutarMotores("RIGHT");
+    } else {
+      ejecutarMotores("STOP");
+    }
+  } 
+  else if (now - lastBleTime < 500) {
+    ejecutarMotores(lastBleCmd);
+  } 
+  else {
+    ejecutarMotores("STOP");
+  }
+
+  delay(10);
+}
+
+
+
+
+
+
+
+//*********************************************************** CODIGO APP WEB *************************************************************************
+//*************************************************************************************************************************************************************
+//************************************************************************************************************************************************************
+
+
+
+
+
+
+
+
+
+
+
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+  <meta name="description" content="Robrain Kids — Plataforma de Rehabilitación y Control EMG"/>
+  <title>Robrain Kids — ¡A Entrenar Jugando!</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Fredoka:wght@400;500;600;700&family=Space+Mono:wght@400;700&display=swap');
+
+    /* ── RESET & VARIABLES ────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --primary: #4fa391;
+      --primary-dark: #356055;
+      --primary-light: #e8f5f1;
+      --primary-border: #a5d3c6;
+      --secondary: #9b5de5;
+      --secondary-light: #f3f0fc;
+      --accent-coral: #ff8fa3;
+      --accent-coral-light: #ffccd5;
+      --accent-gold: #ffb703;
+      --accent-gold-light: #fff3cd;
+      --bg: #fdfbf7;
+      --card-bg: #ffffff;
+      --text: #4a4e69;
+      --text-muted: #7d8597;
+      --border-color: #f0eae1;
+    }
+
+    html, body {
+      height: 100%; width: 100%;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Fredoka', sans-serif;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+    .mono { font-family: 'Space Mono', monospace; }
+    .hidden { display: none !important; }
+
+    /* ── CONTENEDORES Y PANTALLAS ────────────────── */
+    .screen {
+      position: fixed; inset: 0;
+      background: linear-gradient(160deg, #f0f9f6 0%, #fdfbf7 55%, #f3f0fc 100%);
+      display: flex; align-items: flex-start; justify-content: center;
+      z-index: 9999; padding: 16px;
+      overflow-y: auto; -webkit-overflow-scrolling: touch;
+    }
+    .card-modal {
+      background: var(--card-bg);
+      border: 3px solid #e2ece9;
+      border-radius: 28px;
+      padding: 24px 20px;
+      max-width: 440px; width: 100%;
+      text-align: center;
+      box-shadow: 0 16px 40px rgba(165,211,198,0.25);
+      margin: auto;
+    }
+    .app-layout {
+      display: flex; flex-direction: column;
+      width: 100vw; height: 100vh;
+      overflow: hidden;
+    }
+    .main-content {
+      flex: 1; overflow-y: auto; overflow-x: hidden;
+      padding: 16px; background: #fcf9f2;
+      padding-bottom: 90px;
+      -webkit-overflow-scrolling: touch;
+    }
+
+    /* ── HEADER ──────────────────────────────────── */
+    .app-header {
+      background: #ffffff;
+      border-bottom: 3px solid var(--border-color);
+      padding: 10px 16px;
+      display: flex; align-items: center; justify-content: space-between;
+      flex-shrink: 0; z-index: 10;
+    }
+    .header-logo { font-size: 19px; font-weight: 700; color: var(--primary-dark); }
+    .header-pills { display: flex; gap: 6px; }
+    .emg-pill {
+      font-size: 11px; font-weight: 700;
+      padding: 4px 8px; border-radius: 8px;
+      background: var(--border-color); color: var(--text-muted);
+      font-family: 'Space Mono', monospace; min-width: 65px;
+      text-align: center; transition: all 0.15s ease;
+    }
+    .emg-pill.active-L { background: var(--primary-light); color: var(--primary-dark); border: 1px solid var(--primary-border); }
+    .emg-pill.active-R { background: var(--secondary-light); color: var(--secondary); border: 1px solid var(--secondary); }
+
+    /* ── BOTTOM NAV ──────────────────────────────── */
+    .bottom-nav {
+      background: #ffffff;
+      border-top: 3px solid var(--border-color);
+      display: flex; flex-shrink: 0; z-index: 10;
+      position: fixed; bottom: 0; width: 100%;
+      padding-bottom: env(safe-area-inset-bottom);
+    }
+    .nav-btn {
+      flex: 1; background: none; border: none;
+      padding: 10px 4px 8px; display: flex; flex-direction: column;
+      align-items: center; gap: 3px; cursor: pointer;
+      font-family: 'Fredoka', sans-serif; font-size: 11px;
+      font-weight: 700; color: #b0b5d0; transition: color 0.15s;
+    }
+    .nav-btn .nav-icon { font-size: 20px; line-height: 1; }
+    .nav-btn.active { color: var(--primary); }
+
+    /* ── BOTONES ─────────────────────────────────── */
+    .btn {
+      background: var(--primary-border); border: none;
+      color: var(--primary-dark);
+      padding: 14px 20px; border-radius: 16px;
+      font-weight: 700; font-size: 16px;
+      cursor: pointer; text-align: center;
+      box-shadow: 0 5px 0 #84b7aa;
+      width: 100%; transition: all 0.15s;
+      font-family: 'Fredoka', sans-serif;
+    }
+    .btn:active { transform: translateY(3px); box-shadow: 0 2px 0 #84b7aa; }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none !important; box-shadow: none; }
+    
+    .btn-coral { background: var(--accent-coral-light); color: #a44a5e; box-shadow: 0 5px 0 #ffb3c1; }
+    .btn-coral:active { box-shadow: 0 2px 0 #ffb3c1; }
+    .btn-purple { background: var(--secondary-light); color: #432b75; box-shadow: 0 5px 0 #cbb2f0; }
+    .btn-purple:active { box-shadow: 0 2px 0 #cbb2f0; }
+    .btn-gold { background: var(--accent-gold-light); color: #82622b; box-shadow: 0 5px 0 #ffe082; }
+
+    .btn-mode {
+      width: 100%; padding: 16px; border-radius: 20px;
+      font-size: 17px; margin-bottom: 12px;
+      cursor: pointer; border: 3px solid transparent;
+      font-family: 'Fredoka', sans-serif; font-weight: 700;
+      text-align: left; transition: all 0.15s;
+    }
+    .btn-mode:active { transform: translateY(3px); }
+    .btn-mode-auto  { background: var(--primary-light); color: var(--primary-dark); border-color: var(--primary-border); box-shadow: 0 5px 0 #84b7aa; }
+    .btn-mode-games { background: var(--secondary-light); color: #3d3080; border-color: var(--secondary); box-shadow: 0 5px 0 #7a45c4; }
+
+    /* ── TARJETAS BLE ────────────────────────────── */
+    .ble-card {
+      display: flex; align-items: center; gap: 12px;
+      background: #ffffff; border: 2px solid #e8e8ef;
+      border-radius: 16px; padding: 12px 14px;
+      margin-bottom: 10px; text-align: left;
+      transition: all 0.2s;
+    }
+    .ble-card.connected  { background: var(--primary-light); border-color: var(--primary-border); }
+    .ble-card.connecting { background: var(--accent-gold-light); border-color: #ffd54f; }
+    .ble-card.error      { background: #fff5f5; border-color: var(--accent-coral); }
+    .ble-icon { font-size: 26px; flex-shrink: 0; }
+    .ble-info { flex: 1; }
+    .ble-name { font-size: 14px; font-weight: 700; color: var(--text); }
+    .ble-status { font-size: 12px; color: var(--text-muted); font-weight: 500; }
+    .ble-status.ok { color: #27ae60; font-weight: 700; }
+    .ble-status.err { color: #c0392b; font-weight: 700; }
+    .ble-btn {
+      background: var(--primary-border); border: none;
+      color: var(--primary-dark); padding: 8px 12px;
+      border-radius: 12px; font-size: 12px; font-weight: 700;
+      cursor: pointer; font-family: 'Fredoka', sans-serif;
+      box-shadow: 0 3px 0 #84b7aa; flex-shrink: 0;
+    }
+    .ble-btn:active { transform: translateY(2px); box-shadow: 0 1px 0 #84b7aa; }
+
+    /* ── PACIENTES ───────────────────────────────── */
+    .patient-item {
+      background: #ffffff; border: 2px solid var(--border-color);
+      border-radius: 18px; padding: 12px 14px;
+      cursor: pointer; display: flex; align-items: center;
+      gap: 12px; margin-bottom: 10px; transition: all 0.15s;
+    }
+    .patient-item:active { transform: scale(0.98); border-color: var(--primary-border); }
+    .patient-item.selected { border-color: var(--primary); background: var(--primary-light); }
+    .patient-avatar {
+      width: 42px; height: 42px; background: #e8f5f1;
+      border-radius: 14px; display: flex; align-items: center;
+      justify-content: center; font-size: 22px; flex-shrink: 0;
+    }
+    input[type="text"], input[type="number"] {
+      background: #ffffff; border: 2px solid #cbd5e1;
+      color: var(--text); padding: 12px 14px; border-radius: 14px;
+      font-family: 'Fredoka', sans-serif; font-size: 15px;
+      width: 100%; outline: none; margin-bottom: 10px;
+    }
+    input:focus { border-color: var(--primary-border); }
+
+    /* ── CALIBRACIÓN ─────────────────────────────── */
+    .progress-bar-outer {
+      background: #e2ece9; border-radius: 99px;
+      height: 16px; margin: 14px 0; overflow: hidden; width: 100%;
+    }
+    .progress-bar-inner {
+      height: 100%; background: linear-gradient(90deg, var(--primary), #76ead7);
+      width: 0%; transition: width 0.08s linear;
+    }
+    .calib-gauge-box {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 12px;
+    }
+    .calib-gauge {
+      background: #ffffff; border: 2px solid var(--border-color);
+      border-radius: 14px; padding: 10px; text-align: center;
+    }
+
+    /* ── JUEGOS Y CANVAS ─────────────────────────── */
+    .game-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .game-card {
+      border-radius: 20px; padding: 14px 12px;
+      cursor: pointer; border: 3px solid transparent;
+      display: flex; flex-direction: column; gap: 6px;
+      transition: all 0.15s;
+    }
+    .game-card:active { transform: scale(0.96); }
+    .game-icon { font-size: 32px; }
+    .game-title { font-size: 14px; font-weight: 700; line-height: 1.2; }
+    .game-desc { font-size: 11px; opacity: 0.8; line-height: 1.3; }
+
+    .canvas-container {
+      position: relative; width: 100%; height: 280px;
+      background: #191c2b; border-radius: 20px;
+      overflow: hidden; box-shadow: inset 0 4px 12px rgba(0,0,0,0.4);
+    }
+    #gameCanvas { width: 100%; height: 100%; display: block; }
+
+    /* ── HISTORIAL Y DASHBOARD ───────────────────── */
+    .history-card {
+      display: flex; justify-content: space-between;
+      background: #ffffff; padding: 10px 14px;
+      border-radius: 14px; border: 2px solid var(--border-color);
+      font-size: 13px; font-weight: 500; align-items: center;
+    }
+    .stats-row {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 12px;
+    }
+    .stat-box {
+      background: #ffffff; border: 2px solid var(--border-color);
+      border-radius: 16px; padding: 12px; text-align: center;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════
+     PANTALLA 1: CONEXIÓN BLUETOOTH (3 DISPOSITIVOS)
+══════════════════════════════════════════════════════ -->
+<div id="scrnBLE" class="screen">
+  <div class="card-modal">
+    <div style="font-size:46px; margin-bottom:10px;">🧠✨</div>
+    <h1 style="font-size:24px; font-weight:700; color:var(--primary-dark); margin-bottom:4px;">Robrain Kids</h1>
+    <p style="color:var(--text-muted); font-size:13px; margin-bottom:18px;">Conectá los dispositivos para comenzar</p>
+
+    <!-- Brazo Izquierdo -->
+    <div class="ble-card" id="cardEMGL">
+      <div class="ble-icon">👈</div>
+      <div class="ble-info">
+        <div class="ble-name">Brazo Izquierdo <span style="color:#e63946; font-size:10px;">*requerido</span></div>
+        <div class="ble-status" id="statusEMGL">Desconectado</div>
+      </div>
+      <button class="ble-btn" id="btnConnectEMGL" onclick="connectDevice('L')">Conectar</button>
+    </div>
+
+    <!-- Brazo Derecho -->
+    <div class="ble-card" id="cardEMGR">
+      <div class="ble-icon">👉</div>
+      <div class="ble-info">
+        <div class="ble-name">Brazo Derecho <span style="color:#e63946; font-size:10px;">*requerido</span></div>
+        <div class="ble-status" id="statusEMGR">Desconectado</div>
+      </div>
+      <button class="ble-btn" id="btnConnectEMGR" onclick="connectDevice('R')">Conectar</button>
+    </div>
+
+    <!-- Auto RC -->
+    <div class="ble-card" id="cardCar">
+      <div class="ble-icon">🚗</div>
+      <div class="ble-info">
+        <div class="ble-name">Auto RC <span style="font-size:11px; color:var(--text-muted);">(Modo Auto)</span></div>
+        <div class="ble-status" id="statusCar">Desconectado</div>
+      </div>
+      <button class="ble-btn" id="btnConnectCar" onclick="connectDevice('CAR')" style="background:var(--secondary-light); color:#432b75;">Conectar</button>
+    </div>
+
+    <button class="btn" id="btnContinueBLE" onclick="navTo('scrnPatients')" disabled style="margin-top:16px;">
+      Continuar →
+    </button>
+    <p id="bleHelpText" style="font-size:11px; color:var(--text-muted); margin-top:8px;">
+      Conectá ambos brazos para habilitar el sistema
+    </p>
+
+    <!-- Botón para pruebas de simulación en PC sin hardware -->
+    <button onclick="enableDemoMode()" style="background:none; border:none; color:#b0b5d0; font-size:11px; text-decoration:underline; cursor:pointer; margin-top:14px;">
+      ⚡ Probar en modo simulador (sin hardware)
+    </button>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     PANTALLA 2: GESTIÓN DE PACIENTES
+══════════════════════════════════════════════════════ -->
+<div id="scrnPatients" class="screen hidden">
+  <div class="card-modal" style="padding:22px 18px;">
+    <h2 style="font-size:22px; font-weight:700; color:var(--primary-dark); margin-bottom:4px;">¿Quién entrena hoy?</h2>
+    <p style="color:var(--text-muted); font-size:13px; margin-bottom:16px;">Seleccioná o agregá un paciente</p>
+
+    <div id="patientList" style="max-height:220px; overflow-y:auto; margin-bottom:12px;"></div>
+
+    <div style="background:#fdfbf7; border:2px dashed var(--primary-border); border-radius:18px; padding:12px; margin-top:10px;">
+      <div style="font-size:13px; font-weight:700; color:var(--primary-dark); margin-bottom:6px;">➕ Nuevo Amiguito</div>
+      <input type="text" id="inpNewName" placeholder="Nombre completo (ej: Mateo)">
+      <input type="text" id="inpNewDiag" placeholder="Diagnóstico / Objetivo (opcional)">
+      <button class="btn btn-coral" style="padding:10px; font-size:14px;" onclick="addPatient()">Guardar Paciente</button>
+    </div>
+
+    <button onclick="navTo('scrnBLE')" style="background:none; border:none; color:var(--text-muted); font-size:12px; cursor:pointer; margin-top:14px;">
+      ← Volver a Bluetooth
+    </button>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     PANTALLA 3: SELECCIÓN DE MODO
+══════════════════════════════════════════════════════ -->
+<div id="scrnMode" class="screen hidden">
+  <div class="card-modal">
+    <div style="font-size:42px; margin-bottom:10px;">🎯</div>
+    <h2 id="lblModeGreeting" style="font-size:24px; font-weight:700; color:var(--primary-dark); margin-bottom:4px;"></h2>
+    <p style="color:var(--text-muted); font-size:13px; margin-bottom:20px;">¿Qué querés hacer hoy?</p>
+
+    <button class="btn-mode btn-mode-games" onclick="startFlow('games')">
+      🎮 Mini Juegos de Rehabilitación
+      <div style="font-size:12px; font-weight:500; opacity:0.8; margin-top:4px;">4 juegos adaptados para ejercitar músculos</div>
+    </button>
+
+    <button class="btn-mode btn-mode-auto" onclick="startFlow('auto')">
+      🚗 Manejar el Auto (Control Directo)
+      <div style="font-size:12px; font-weight:500; opacity:0.8; margin-top:4px;">ESP-NOW de ultra baja latencia (<2ms)</div>
+    </button>
+
+    <button onclick="navTo('scrnPatients')" style="background:none; border:none; color:var(--text-muted); font-size:13px; cursor:pointer; margin-top:10px;">
+      ← Cambiar Paciente
+    </button>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     PANTALLA 4: CALIBRACIÓN GUIADA (2 FASES)
+══════════════════════════════════════════════════════ -->
+<div id="scrnCalib" class="screen hidden">
+  <div class="card-modal">
+    <div id="calibEmoji" style="font-size:48px; margin-bottom:8px;">🧘</div>
+    <h2 id="calibTitle" style="font-size:22px; font-weight:700; color:var(--primary-dark);">Fase 1: Reposo</h2>
+    <p id="calibDesc" style="color:var(--text-muted); font-size:13px; margin:8px 0 14px;">
+      Mantené los brazos completamente relajados...
+    </p>
+
+    <div class="progress-bar-outer">
+      <div class="progress-bar-inner" id="calibProgress"></div>
+    </div>
+
+    <div class="calib-gauge-box mono">
+      <div class="calib-gauge" style="background:#e8f5f1;">
+        <div style="font-size:11px; color:var(--primary-dark); font-weight:700;">BRAZO IZQ</div>
+        <div style="font-size:20px; font-weight:700; color:var(--primary);" id="calibLiveL">0</div>
+        <div style="font-size:10px; color:#888;">Umbral: <span id="calibThreshL">--</span></div>
+      </div>
+      <div class="calib-gauge" style="background:#f3f0fc;">
+        <div style="font-size:11px; color:#3d3080; font-weight:700;">BRAZO DER</div>
+        <div style="font-size:20px; font-weight:700; color:var(--secondary);" id="calibLiveR">0</div>
+        <div style="font-size:10px; color:#888;">Umbral: <span id="calibThreshR">--</span></div>
+      </div>
+    </div>
+
+    <div id="calibActionContainer" style="margin-top:16px;">
+      <button class="btn btn-gold hidden" id="btnStartPhase2" onclick="startCalibPhase2()">
+        💪 ¡Listo para hacer Fuerza Máxima!
+      </button>
+      <button class="btn hidden" id="btnFinishCalib" onclick="finishCalibration()">
+        ✅ Guardar y Comenzar
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════
+     PANTALLA 5: APLICACIÓN PRINCIPAL (JUEGOS / AUTO)
+══════════════════════════════════════════════════════ -->
+<div id="scrnApp" class="app-layout hidden">
+  <!-- Header -->
+  <div class="app-header">
+    <div>
+      <div class="header-logo">🤖 Robrain Kids</div>
+      <div style="font-size:11px; color:var(--text-muted);" id="lblCurrentPatientHeader">Paciente: --</div>
+    </div>
+    <div class="header-pills">
+      <div class="emg-pill" id="hudPillL">Izq: 0</div>
+      <div class="emg-pill" id="hudPillR">Der: 0</div>
+    </div>
+  </div>
+
+  <!-- Vista 1: Sección Juegos -->
+  <div class="main-content" id="viewGames">
+    
+    <!-- Canvas de Juego Activo -->
+    <div id="boxGameActive" class="hidden" style="display:flex; flex-direction:column; gap:12px;">
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div>
+          <div style="font-size:16px; font-weight:700; color:var(--primary);" id="lblActiveGameTitle">Juego</div>
+          <div style="font-size:11px; color:var(--text-muted);">Usa: <b id="lblGameHelp">Izq (←) | Ambos (↑) | Der (→)</b></div>
+        </div>
+        <div style="display:flex; gap:6px;">
+          <button class="btn" style="width:auto; padding:6px 12px; font-size:12px; background:#fff; color:#666;" onclick="togglePauseGame()" id="btnPauseGame">⏸️</button>
+          <button class="btn btn-coral" style="width:auto; padding:6px 14px; font-size:12px;" onclick="stopGame(true)">✕ Salir</button>
+        </div>
+      </div>
+      <div class="canvas-container">
+        <canvas id="gameCanvas"></canvas>
+      </div>
+    </div>
+
+    <!-- Menú Principal de Juegos -->
+    <div id="boxGameMenu">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+        <h2 style="font-size:20px; font-weight:700; color:var(--primary-dark);">¡Elegí tu aventura!</h2>
+        <!-- Selector de Dificultad -->
+        <select id="selDifficulty" style="padding:6px 10px; border-radius:12px; font-family:'Fredoka'; font-size:12px; font-weight:700; border:2px solid var(--border-color); outline:none;">
+          <option value="1">Tortuga 🐢 (Fácil)</option>
+          <option value="1.4" selected>Gato 🐱 (Medio)</option>
+          <option value="2">Guepardo 🐆 (Rápido)</option>
+        </select>
+      </div>
+
+      <div class="game-grid">
+        <!-- Juego 1 -->
+        <div class="game-card" onclick="launchGame('balloons')" style="background:#f4f9f4; border-color:var(--primary-border);">
+          <div class="game-icon">🎈</div>
+          <div class="game-title" style="color:#2e4740;">Estallido de Globos</div>
+          <div class="game-desc">Explotá globos usando el brazo correspondiente a tiempo.</div>
+        </div>
+        <!-- Juego 2 -->
+        <div class="game-card" onclick="launchGame('reaction')" style="background:#fffaf0; border-color:var(--accent-gold);">
+          <div class="game-icon">🐹🔨</div>
+          <div class="game-title" style="color:#82622b;">Pegale al Topo</div>
+          <div class="game-desc">Reaccioná rápido cuando salga el topo (Izq, Ambos o Der).</div>
+        </div>
+        <!-- Juego 3 -->
+        <div class="game-card" onclick="launchGame('car')" style="background:#fdf2f4; border-color:var(--accent-coral-light);">
+          <div class="game-icon">🏎️💨</div>
+          <div class="game-title" style="color:#a44a5e;">Súper Auto Adaptado</div>
+          <div class="game-desc">Esquivá obstáculos y juntá monedas en la pista.</div>
+        </div>
+        <!-- Juego 4 -->
+        <div class="game-card" onclick="launchGame('guitar')" style="background:var(--secondary-light); border-color:var(--secondary);">
+          <div class="game-icon">🎸⭐</div>
+          <div class="game-title" style="color:#52489c;">Estrella de Rock</div>
+          <div class="game-desc">Seguí el ritmo de las notas musicales al caer.</div>
+        </div>
+      </div>
+
+      <h3 style="font-size:16px; font-weight:700; margin:22px 0 10px; color:var(--text);">🏆 Progreso de Sesiones</h3>
+      <div id="patientHistoryContainer" style="display:flex; flex-direction:column; gap:8px;"></div>
+    </div>
+  </div>
+
+  <!-- Vista 2: Sección Auto RC -->
+  <div class="main-content hidden" id="viewAuto" style="text-align:center;">
+    <div style="font-size:56px; margin:16px 0 8px;">🏎️💨</div>
+    <h2 style="font-size:22px; font-weight:700; color:var(--primary-dark); margin-bottom:4px;">Control del Auto RC</h2>
+    <p style="font-size:13px; color:var(--text-muted); margin-bottom:16px;">
+      Comunicación directa ESP-NOW activa (<2ms)
+    </p>
+
+    <!-- Display de Estado -->
+    <div style="background:#ffffff; border:3px solid var(--border-color); border-radius:24px; padding:20px; margin-bottom:16px;">
+      <div style="font-size:11px; font-weight:700; color:#a2a7cb; letter-spacing:0.5px;">ESTADO DE MOVIMIENTO</div>
+      <div id="autoCmdDisplay" style="font-size:36px; font-weight:700; color:var(--primary); margin:8px 0;">■ FRENADO</div>
+      
+      <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:14px;" class="mono">
+        <div style="background:#f7f7fc; padding:10px; border-radius:12px;" id="autoArmL">
+          <div style="font-size:11px; color:#666;">Brazo Izq</div>
+          <div style="font-size:16px; font-weight:700;" id="autoValL">0</div>
+        </div>
+        <div style="background:#f7f7fc; padding:10px; border-radius:12px;" id="autoArmR">
+          <div style="font-size:11px; color:#666;">Brazo Der</div>
+          <div style="font-size:16px; font-weight:700;" id="autoValR">0</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Guía de Control -->
+    <div style="background:#ffffff; border:2px solid var(--border-color); border-radius:18px; padding:14px; text-align:left; font-size:13px; line-height:2.1; margin-bottom:16px;">
+      <b>Brazo Izquierdo</b> → Girar Izquierda ◄<br>
+      <b>Brazo Derecho</b> → Girar Derecha ►<br>
+      <b>Ambos brazos juntos</b> → Avanzar ▲<br>
+      <b>Sin fuerza (reposo)</b> → Freno automático ■
+    </div>
+
+    <!-- Botón Parada de Emergencia -->
+    <button class="btn btn-coral" style="padding:14px;" onclick="emergencyStop()">
+      🛑 PARADA DE EMERGENCIA
+    </button>
+  </div>
+
+  <!-- Vista 3: Ajustes / Paciente -->
+  <div class="main-content hidden" id="viewSettings">
+    <h2 style="font-size:20px; font-weight:700; margin-bottom:14px;">⚙️ Configuración y Calibración</h2>
+    <div style="background:#ffffff; border:2px solid var(--border-color); border-radius:18px; padding:16px; margin-bottom:14px;">
+      <div style="font-size:14px; font-weight:700; margin-bottom:8px;">Perfil Actual</div>
+      <div id="settingsPatientInfo" style="font-size:13px; color:var(--text-muted); line-height:1.8;"></div>
+      <button class="btn" style="margin-top:12px; font-size:14px; padding:10px;" onclick="recalibrateCurrentPatient()">
+        🔄 Recalibrar Sensores
+      </button>
+    </div>
+
+    <!-- Panel de sensibilidad por paciente -->
+    <div style="background:#ffffff; border:2px solid var(--border-color); border-radius:18px; padding:16px; margin-bottom:14px;">
+      <div style="font-size:14px; font-weight:700; margin-bottom:4px;">🎚️ Sensibilidad de Detección</div>
+      <div style="font-size:12px; color:var(--text-muted); margin-bottom:14px;">
+        Ajustá el nivel mínimo de señal muscular para activar el movimiento. Bajá el umbral para pacientes con menor capacidad motriz.
+      </div>
+
+      <!-- Brazo Izquierdo -->
+      <div style="margin-bottom:16px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+          <span style="font-size:13px; font-weight:600;">Brazo Izquierdo</span>
+          <span style="font-size:13px; font-weight:700; color:var(--primary);" id="lblThreshL">--</span>
+        </div>
+        <input type="range" id="sliderThreshL" min="100" max="3000" step="50"
+          style="width:100%; accent-color:var(--primary);"
+          oninput="onSliderThresh('L', this.value)">
+        <div style="display:flex; justify-content:space-between; font-size:10px; color:var(--text-muted); margin-top:2px;">
+          <span>Muy sensible</span><span>Poco sensible</span>
+        </div>
+      </div>
+
+      <!-- Brazo Derecho -->
+      <div style="margin-bottom:16px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+          <span style="font-size:13px; font-weight:600;">Brazo Derecho</span>
+          <span style="font-size:13px; font-weight:700; color:var(--secondary);" id="lblThreshR">--</span>
+        </div>
+        <input type="range" id="sliderThreshR" min="100" max="3000" step="50"
+          style="width:100%; accent-color:var(--secondary);"
+          oninput="onSliderThresh('R', this.value)">
+        <div style="display:flex; justify-content:space-between; font-size:10px; color:var(--text-muted); margin-top:2px;">
+          <span>Muy sensible</span><span>Poco sensible</span>
+        </div>
+      </div>
+
+      <!-- Señal en vivo para referencia -->
+      <div style="background:#f8f8fc; border-radius:12px; padding:10px; font-size:12px; margin-bottom:14px; display:flex; gap:12px; justify-content:center;">
+        <span>Señal actual Izq: <b id="liveValL_settings">--</b></span>
+        <span>·</span>
+        <span>Señal actual Der: <b id="liveValR_settings">--</b></span>
+      </div>
+
+      <!-- Botones rápidos de sensibilidad -->
+      <div style="font-size:12px; font-weight:600; color:var(--text-muted); margin-bottom:8px;">Presets rápidos:</div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; margin-bottom:14px;">
+        <button class="btn" style="flex:1; padding:8px; font-size:12px; background:#ffecec; color:#a33; box-shadow:none;" onclick="applyPreset('alta')">
+          🟥 Alta capacidad
+        </button>
+        <button class="btn" style="flex:1; padding:8px; font-size:12px; background:#fff8e1; color:#a07000; box-shadow:none;" onclick="applyPreset('media')">
+          🟨 Capacidad media
+        </button>
+        <button class="btn" style="flex:1; padding:8px; font-size:12px; background:#e8f5f1; color:#2e4740; box-shadow:none;" onclick="applyPreset('baja')">
+          🟩 Movilidad reducida
+        </button>
+      </div>
+
+      <button class="btn" style="width:100%; padding:10px; font-size:14px;" onclick="saveThresholds()">
+        💾 Guardar sensibilidad
+      </button>
+      <div id="threshSaveMsg" style="font-size:12px; color:var(--primary); text-align:center; margin-top:8px; min-height:16px;"></div>
+    </div>
+
+    <div style="background:#ffffff; border:2px solid var(--border-color); border-radius:18px; padding:16px;">
+      <div style="font-size:14px; font-weight:700; margin-bottom:8px;">Dispositivos Bluetooth</div>
+      <div id="settingsBleStatus" style="font-size:13px; line-height:2;"></div>
+      <button class="btn btn-purple" style="margin-top:12px; font-size:14px; padding:10px;" onclick="navTo('scrnBLE')">
+        📡 Administrar Conexiones
+      </button>
+    </div>
+  </div>
+
+  <!-- Bottom Navigation -->
+  <nav class="bottom-nav">
+    <button class="nav-btn active" id="navBtnGames" onclick="switchAppTab('games')">
+      <span class="nav-icon">🎮</span><span>Juegos</span>
+    </button>
+    <button class="nav-btn" id="navBtnAuto" onclick="switchAppTab('auto')">
+      <span class="nav-icon">🚗</span><span>Auto RC</span>
+    </button>
+    <button class="nav-btn" id="navBtnSettings" onclick="switchAppTab('settings')">
+      <span class="nav-icon">⚙️</span><span>Ajustes</span>
+    </button>
+  </nav>
+</div>
+
+<script>
+/* ══════════════════════════════════════════════════════════
+   SISTEMA DE AUDIO SINTETIZADO (Web Audio API)
+══════════════════════════════════════════════════════════ */
+let audioCtx = null;
+function initAudio() {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  }
+}
+
+function playSound(type) {
+  try {
+    initAudio();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const now = audioCtx.currentTime;
+
+    if (type === 'pop') {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(400, now);
+      osc.frequency.exponentialRampToValueAtTime(800, now + 0.1);
+      gain.gain.setValueAtTime(0.3, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.1);
+      osc.connect(gain); gain.connect(audioCtx.destination);
+      osc.start(now); osc.stop(now + 0.1);
+    } 
+    else if (type === 'hit') {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(520, now);
+      osc.frequency.exponentialRampToValueAtTime(320, now + 0.15);
+      gain.gain.setValueAtTime(0.4, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
+      osc.connect(gain); gain.connect(audioCtx.destination);
+      osc.start(now); osc.stop(now + 0.15);
+    }
+    else if (type === 'coin') {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(987, now);
+      osc.frequency.setValueAtTime(1318, now + 0.08);
+      gain.gain.setValueAtTime(0.25, now);
+      gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+      osc.connect(gain); gain.connect(audioCtx.destination);
+      osc.start(now); osc.stop(now + 0.25);
+    }
+    else if (type === 'noteL') { playTone(261.63, 0.2); } // C4
+    else if (type === 'noteBoth') { playTone(329.63, 0.2); } // E4
+    else if (type === 'noteR') { playTone(392.00, 0.2); } // G4
+    else if (type === 'win') {
+      [261, 329, 392, 523].forEach((f, i) => {
+        setTimeout(() => playTone(f, 0.15), i * 100);
+      });
+    }
+  } catch(e) {}
+}
+
+function playTone(freq, dur) {
+  const now = audioCtx.currentTime;
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = 'sine';
+  osc.frequency.setValueAtTime(freq, now);
+  gain.gain.setValueAtTime(0.3, now);
+  gain.gain.exponentialRampToValueAtTime(0.01, now + dur);
+  osc.connect(gain); gain.connect(audioCtx.destination);
+  osc.start(now); osc.stop(now + dur);
+}
+
+/* ══════════════════════════════════════════════════════════
+   ESTADO GLOBAL & BLUETOOTH
+══════════════════════════════════════════════════════════ */
+const UUID_SERVICE_EMG = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
+const UUID_CHAR_EMG    = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+const UUID_SERVICE_CAR = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const UUID_CHAR_CAR    = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+
+const bleState = {
+  L:   { device: null, server: null, char: null, connected: false, val: 0 },
+  R:   { device: null, server: null, char: null, connected: false, val: 0 },
+  CAR: { device: null, server: null, char: null, connected: false }
+};
+
+let isDemoMode = false;
+let activePatient = null;
+let currentAppMode = null; // 'games' o 'auto'
+
+// Helper seguro de escritura BLE
+async function safeWriteBLE(charObj, textData) {
+  if (!charObj) return;
+  try {
+    const encoded = new TextEncoder().encode(textData);
+    if (charObj.writeValueWithoutResponse) {
+      await charObj.writeValueWithoutResponse(encoded);
+    } else {
+      await charObj.writeValue(encoded);
+    }
+  } catch(e) {
+    console.warn("Error escribiendo BLE:", e);
+  }
+}
+
+// Conexión Bluetooth Individual
+async function connectDevice(type) {
+  if (!navigator.bluetooth) {
+    alert("Web Bluetooth no está disponible. Usa Chrome en Android o Bluefy en iOS sobre HTTPS.");
+    return;
+  }
+
+  const srvUUID = (type === 'CAR') ? UUID_SERVICE_CAR : UUID_SERVICE_EMG;
+  const charUUID = (type === 'CAR') ? UUID_CHAR_CAR : UUID_CHAR_EMG;
+  const targetName = (type === 'CAR') ? 'Robrain-Car' : (type === 'L' ? 'Robrain-EMG-L' : 'Robrain-EMG-R');
+  const cardId = (type === 'CAR') ? 'cardCar' : (type === 'L' ? 'cardEMGL' : 'cardEMGR');
+  const statusId = (type === 'CAR') ? 'statusCar' : (type === 'L' ? 'statusEMGL' : 'statusEMGR');
+  const btnId = (type === 'CAR') ? 'btnConnectCar' : (type === 'L' ? 'btnConnectEMGL' : 'btnConnectEMGR');
+
+  const card = document.getElementById(cardId);
+  const statusEl = document.getElementById(statusId);
+  const btn = document.getElementById(btnId);
+
+  statusEl.className = 'ble-status';
+  statusEl.innerText = 'Buscando...';
+  card.className = 'ble-card connecting';
+  btn.disabled = true;
+
+  try {
+    const device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: targetName }],
+      optionalServices: [srvUUID]
+    });
+
+    device.addEventListener('gattserverdisconnected', () => {
+      bleState[type].connected = false;
+      statusEl.className = 'ble-status err';
+      statusEl.innerText = 'Desconectado ❌';
+      card.className = 'ble-card error';
+      btn.disabled = false;
+      btn.innerText = 'Reconectar';
+      checkAllBleReady();
+      updateSettingsUI();
+    });
+
+    statusEl.innerText = 'Conectando...';
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(srvUUID);
+    const characteristic = await service.getCharacteristic(charUUID);
+
+    if (type !== 'CAR') {
+      await characteristic.startNotifications();
+      characteristic.addEventListener('characteristicvaluechanged', (e) => {
+        const raw = new TextDecoder().decode(e.target.value).trim();
+        const num = parseInt(raw) || 0;
+        bleState[type].val = num;
+        onEMGDataReceived(type, num);
+      });
+    }
+
+    bleState[type].device = device;
+    bleState[type].server = server;
+    bleState[type].char = characteristic;
+    bleState[type].connected = true;
+
+    statusEl.className = 'ble-status ok';
+    statusEl.innerText = 'Conectado ✅';
+    card.className = 'ble-card connected';
+    btn.disabled = false;
+    btn.innerText = 'Listo';
+
+    checkAllBleReady();
+    updateSettingsUI();
+  } catch(err) {
+    if (err.name !== 'NotFoundError') {
+      statusEl.className = 'ble-status err';
+      statusEl.innerText = 'Error de conexión';
+      card.className = 'ble-card error';
+    } else {
+      statusEl.innerText = 'Cancelado';
+      card.className = 'ble-card';
+    }
+    btn.disabled = false;
+  }
+}
+
+function checkAllBleReady() {
+  const ready = (bleState.L.connected && bleState.R.connected) || isDemoMode;
+  document.getElementById('btnContinueBLE').disabled = !ready;
+  if (ready) {
+    document.getElementById('bleHelpText').style.display = 'none';
+  }
+}
+
+function enableDemoMode() {
+  isDemoMode = true;
+  document.getElementById('statusEMGL').innerText = 'Simulador ACTIVO ⚡';
+  document.getElementById('statusEMGR').innerText = 'Simulador ACTIVO ⚡';
+  document.getElementById('cardEMGL').className = 'ble-card connected';
+  document.getElementById('cardEMGR').className = 'ble-card connected';
+  checkAllBleReady();
+  navTo('scrnPatients');
+}
+
+/* ══════════════════════════════════════════════════════════
+   GESTIÓN DE PACIENTES (Persistencia LocalStorage)
+══════════════════════════════════════════════════════════ */
+const STORAGE_KEY = 'robrain_kids_patients_v2';
+
+function loadPatients() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch(e) {}
+  return [
+    {
+      id: 'p1', name: 'Mateo García', diag: 'Entrenamiento bimanual',
+      threshL: 1450, threshR: 1450, restL: 200, restR: 200, maxL: 3200, maxR: 3200,
+      sessions: [
+        { date: '18/08', game: 'Estallido de Globos', score: 280, accuracy: 95 },
+        { date: '17/08', game: 'Pegale al Topo', score: 190, avgRt: 420 }
+      ]
+    },
+    {
+      id: 'p2', name: 'Valentina Cruz', diag: 'Coordinación neuromuscular',
+      threshL: 1500, threshR: 1500, restL: 250, restR: 250, maxL: 2900, maxR: 2900,
+      sessions: []
+    }
+  ];
+}
+
+let patients = loadPatients();
+
+function savePatients() {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(patients));
+  } catch(e) {}
+}
+
+function renderPatientList() {
+  const container = document.getElementById('patientList');
+  container.innerHTML = '';
+  patients.forEach(p => {
+    const div = document.createElement('div');
+    div.className = 'patient-item' + (activePatient && activePatient.id === p.id ? ' selected' : '');
+    div.innerHTML = `
+      <div class="patient-avatar">🦁</div>
+      <div style="flex:1; text-align:left;">
+        <div style="font-weight:700; color:var(--text); font-size:15px;">${p.name}</div>
+        <div style="font-size:11px; color:var(--text-muted);">${p.diag || 'Sin diagnóstico'}</div>
+        <div style="font-size:10px; color:var(--primary); font-weight:700; margin-top:2px;">
+          ${p.sessions.length} partida${p.sessions.length !== 1 ? 's' : ''} · Umbrales: L:${p.threshL} R:${p.threshR}
+        </div>
+      </div>
+      <div style="font-size:18px; color:#cbd5e1;">›</div>
+    `;
+    div.onclick = () => selectPatient(p.id);
+    container.appendChild(div);
+  });
+}
+
+function addPatient() {
+  const name = document.getElementById('inpNewName').value.trim();
+  const diag = document.getElementById('inpNewDiag').value.trim();
+  if (!name) {
+    alert("Por favor ingresá el nombre del paciente.");
+    return;
+  }
+  const newP = {
+    id: 'p_' + Date.now(),
+    name: name,
+    diag: diag || 'Entrenamiento general',
+    threshL: 1500, threshR: 1500, restL: 200, restR: 200, maxL: 3000, maxR: 3000,
+    sessions: []
+  };
+  patients.unshift(newP);
+  savePatients();
+  document.getElementById('inpNewName').value = '';
+  document.getElementById('inpNewDiag').value = '';
+  selectPatient(newP.id);
+}
+
+function selectPatient(id) {
+  activePatient = patients.find(p => p.id === id);
+  document.getElementById('lblModeGreeting').innerText = `¡Hola, ${activePatient.name.split(' ')[0]}! 👋`;
+  document.getElementById('lblCurrentPatientHeader').innerText = `Paciente: ${activePatient.name}`;
+  renderPatientList();
+  renderHistory();
+  updateSettingsUI();
+  navTo('scrnMode');
+}
+
+/* ══════════════════════════════════════════════════════════
+   CALIBRACIÓN EN 2 FASES (REPOSO + TENSIÓN MÁXIMA)
+══════════════════════════════════════════════════════════ */
+let calibTimer = null;
+let calibSamples = { restL: [], restR: [], maxL: [], maxR: [] };
+let isCalibrating = false;
+
+function startFlow(mode) {
+  currentAppMode = mode;
+  // Si el paciente nunca calibró o queremos recalibrar:
+  startCalibPhase1();
+}
+
+function startCalibPhase1() {
+  navTo('scrnCalib');
+  isCalibrating = true;
+  calibSamples = { restL: [], restR: [], maxL: [], maxR: [] };
+
+  document.getElementById('calibEmoji').innerText = '🧘';
+  document.getElementById('calibTitle').innerText = 'Fase 1: Reposo';
+  document.getElementById('calibDesc').innerText = 'Mantené los brazos completamente relajados...';
+  document.getElementById('calibProgress').style.width = '0%';
+  document.getElementById('btnStartPhase2').classList.add('hidden');
+  document.getElementById('btnFinishCalib').classList.add('hidden');
+
+  let pct = 0;
+  clearInterval(calibTimer);
+  calibTimer = setInterval(() => {
+    pct += 2.5; // ~4 segundos
+    document.getElementById('calibProgress').style.width = pct + '%';
+    calibSamples.restL.push(bleState.L.val);
+    calibSamples.restR.push(bleState.R.val);
+
+    if (pct >= 100) {
+      clearInterval(calibTimer);
+      playSound('pop');
+      document.getElementById('calibEmoji').innerText = '✨';
+      document.getElementById('calibTitle').innerText = '¡Reposo registrado!';
+      document.getElementById('calibDesc').innerText = 'Ahora mediremos la fuerza máxima voluntaria.';
+      document.getElementById('btnStartPhase2').classList.remove('hidden');
+    }
+  }, 100);
+}
+
+function startCalibPhase2() {
+  document.getElementById('calibEmoji').innerText = '💪';
+  document.getElementById('calibTitle').innerText = 'Fase 2: ¡Tensión Máxima!';
+  document.getElementById('calibDesc').innerText = '¡Apretá los dos brazos con fuerza!';
+  document.getElementById('calibProgress').style.width = '0%';
+  document.getElementById('btnStartPhase2').classList.add('hidden');
+
+  let pct = 0;
+  clearInterval(calibTimer);
+  calibTimer = setInterval(() => {
+    pct += 2.5;
+    document.getElementById('calibProgress').style.width = pct + '%';
+    calibSamples.maxL.push(bleState.L.val);
+    calibSamples.maxR.push(bleState.R.val);
+
+    if (pct >= 100) {
+      clearInterval(calibTimer);
+      isCalibrating = false;
+      playSound('win');
+
+      // 1. Cálculo de Medias y Picos
+      const avgRestL = Math.round(calibSamples.restL.reduce((a,b)=>a+b,0) / (calibSamples.restL.length || 1));
+      const avgRestR = Math.round(calibSamples.restR.reduce((a,b)=>a+b,0) / (calibSamples.restR.length || 1));
+      const peakMaxL = Math.max(...calibSamples.maxL, avgRestL + 500);
+      const peakMaxR = Math.max(...calibSamples.maxR, avgRestR + 500);
+
+      // 2. Umbral inteligente: 35% del rango dinámico
+      const threshL = Math.round(avgRestL + (peakMaxL - avgRestL) * 0.35);
+      const threshR = Math.round(avgRestR + (peakMaxR - avgRestR) * 0.35);
+
+      // 3. Guardar en paciente
+      activePatient.restL = avgRestL; activePatient.restR = avgRestR;
+      activePatient.maxL = peakMaxL;   activePatient.maxR = peakMaxR;
+      activePatient.threshL = threshL; activePatient.threshR = threshR;
+      savePatients();
+
+      // 4. Mostrar en pantalla
+      document.getElementById('calibThreshL').innerText = threshL;
+      document.getElementById('calibThreshR').innerText = threshR;
+      document.getElementById('calibEmoji').innerText = '🎉';
+      document.getElementById('calibTitle').innerText = '¡Calibración Exitosa!';
+      document.getElementById('calibDesc').innerText = `Umbral Izq: ${threshL} | Umbral Der: ${threshR}`;
+      document.getElementById('btnFinishCalib').classList.remove('hidden');
+
+      // 5. Enviar nuevos umbrales a los ESP32-C3 por BLE
+      safeWriteBLE(bleState.L.char, `SET_TH:${threshL}`);
+      safeWriteBLE(bleState.R.char, `SET_TH:${threshR}`);
+    }
+  }, 100);
+}
+
+function finishCalibration() {
+  navTo('scrnApp');
+  if (currentAppMode === 'auto') {
+    switchAppTab('auto');
+    // Activar modo Auto en los ESP32 (inicia transmisión directa ESP-NOW)
+    safeWriteBLE(bleState.L.char, 'MODE:AUTO');
+    safeWriteBLE(bleState.R.char, 'MODE:AUTO');
+  } else {
+    switchAppTab('games');
+    safeWriteBLE(bleState.L.char, 'MODE:GAMES');
+    safeWriteBLE(bleState.R.char, 'MODE:GAMES');
+  }
+}
+
+function recalibrateCurrentPatient() {
+  startCalibPhase1();
+}
+
+/* ══════════════════════════════════════════════════════════
+   PROCESAMIENTO DE SEÑALES EMG EN TIEMPO REAL
+══════════════════════════════════════════════════════════ */
+let lastActiveCommand = "STOP";
+
+function onEMGDataReceived(arm, val) {
+  // Actualizar gauges del header
+  const pillL = document.getElementById('hudPillL');
+  const pillR = document.getElementById('hudPillR');
+  
+  const threshL = (activePatient ? activePatient.threshL : 1500);
+  const threshR = (activePatient ? activePatient.threshR : 1500);
+
+  const actL = bleState.L.val >= threshL;
+  const actR = bleState.R.val >= threshR;
+
+  if (pillL) {
+    pillL.innerText = `Izq: ${bleState.L.val}`;
+    pillL.className = 'emg-pill' + (actL ? ' active-L' : '');
+  }
+  if (pillR) {
+    pillR.innerText = `Der: ${bleState.R.val}`;
+    pillR.className = 'emg-pill' + (actR ? ' active-R' : '');
+  }
+
+  // Actualizar gauges de calibración si está activa
+  if (isCalibrating) {
+    document.getElementById('calibLiveL').innerText = bleState.L.val;
+    document.getElementById('calibLiveR').innerText = bleState.R.val;
+  }
+
+  // Actualizar señal en vivo en el panel de Ajustes (referencia para el profesional)
+  const liveL = document.getElementById('liveValL_settings');
+  const liveR = document.getElementById('liveValR_settings');
+  if (liveL) liveL.innerText = bleState.L.val;
+  if (liveR) liveR.innerText = bleState.R.val;
+
+  // Actualizar modo Auto
+  if (currentAppMode === 'auto') {
+    document.getElementById('autoValL').innerText = bleState.L.val;
+    document.getElementById('autoValR').innerText = bleState.R.val;
+    document.getElementById('autoArmL').style.background = actL ? 'var(--primary-light)' : '#f7f7fc';
+    document.getElementById('autoArmR').style.background = actR ? 'var(--secondary-light)' : '#f7f7fc';
+
+    let cmd = "STOP";
+    if (actL && actR) cmd = "FORWARD";
+    else if (actL) cmd = "LEFT";
+    else if (actR) cmd = "RIGHT";
+
+    if (cmd !== lastActiveCommand) {
+      lastActiveCommand = cmd;
+      const cmdMap = { FORWARD: '▲ AVANZAR', LEFT: '◄ IZQUIERDA', RIGHT: '► DERECHA', STOP: '■ FRENADO' };
+      document.getElementById('autoCmdDisplay').innerText = cmdMap[cmd];
+
+      // Enviar respaldo por BLE al auto si está conectado
+      if (bleState.CAR.connected) {
+        safeWriteBLE(bleState.CAR.char, cmd);
+      }
+    }
+  }
+}
+
+function emergencyStop() {
+  lastActiveCommand = "STOP";
+  document.getElementById('autoCmdDisplay').innerText = '■ FRENADO';
+  if (bleState.CAR.connected) {
+    safeWriteBLE(bleState.CAR.char, "STOP");
+  }
+}
+
+/* ══════════════════════════════════════════════════════════
+   SENSIBILIDAD CONFIGURABLE POR PACIENTE
+══════════════════════════════════════════════════════════ */
+function updateSettingsSensitivity() {
+  if (!activePatient) return;
+  const tL = activePatient.threshL || 800;
+  const tR = activePatient.threshR || 800;
+  const slL = document.getElementById('sliderThreshL');
+  const slR = document.getElementById('sliderThreshR');
+  if (slL) { slL.value = tL; document.getElementById('lblThreshL').innerText = tL; }
+  if (slR) { slR.value = tR; document.getElementById('lblThreshR').innerText = tR; }
+}
+
+function onSliderThresh(arm, val) {
+  val = parseInt(val);
+  if (arm === 'L') document.getElementById('lblThreshL').innerText = val;
+  else             document.getElementById('lblThreshR').innerText = val;
+}
+
+function applyPreset(level) {
+  if (!activePatient) return;
+  // Los presets se calculan como fracción del rango dinámico calibrado
+  const restL  = activePatient.restL  || 200;
+  const restR  = activePatient.restR  || 200;
+  const maxL   = activePatient.maxL   || 2000;
+  const maxR   = activePatient.maxR   || 2000;
+  const pct = level === 'alta' ? 0.50 : level === 'media' ? 0.30 : 0.15;
+  const tL = Math.round(restL + (maxL - restL) * pct);
+  const tR = Math.round(restR + (maxR - restR) * pct);
+  document.getElementById('sliderThreshL').value = tL;
+  document.getElementById('sliderThreshR').value = tR;
+  document.getElementById('lblThreshL').innerText = tL;
+  document.getElementById('lblThreshR').innerText = tR;
+}
+
+function saveThresholds() {
+  if (!activePatient) return;
+  const tL = parseInt(document.getElementById('sliderThreshL').value);
+  const tR = parseInt(document.getElementById('sliderThreshR').value);
+  activePatient.threshL = tL;
+  activePatient.threshR = tR;
+  savePatients();
+  // Enviar nuevos umbrales a los ESP32-C3
+  safeWriteBLE(bleState.L.char, `SET_TH:${tL}`);
+  safeWriteBLE(bleState.R.char, `SET_TH:${tR}`);
+  const msg = document.getElementById('threshSaveMsg');
+  msg.innerText = `✅ Guardado — Izq: ${tL} · Der: ${tR}`;
+  setTimeout(() => { msg.innerText = ''; }, 3000);
+  updateSettingsUI();
+}
+
+/* ══════════════════════════════════════════════════════════
+   4 MINI-JUEGOS DE REHABILITACIÓN (Canvas 2D)
+══════════════════════════════════════════════════════════ */
+let canvas, ctx, animFrameId, gameInterval;
+let activeGame = null;
+let isPaused = false;
+let gameState = {};
+
+function launchGame(type) {
+  activeGame = type;
+  isPaused = false;
+  document.getElementById('btnPauseGame').innerText = '⏸️';
+  document.getElementById('boxGameMenu').classList.add('hidden');
+  document.getElementById('boxGameActive').classList.remove('hidden');
+
+  const titles = {
+    balloons: '🎈 Estallido de Globos',
+    reaction: '🐹🔨 Pegale al Topo',
+    car: '🏎️💨 Súper Auto Adaptado',
+    guitar: '🎸⭐ Estrella de Rock'
+  };
+  const helps = {
+    balloons: 'Brazo Izq (←) o Brazo Der (→)',
+    reaction: 'Izq (←) | ¡Ambos! (↑) | Der (→)',
+    car: 'Izq (Carril 1) | Ambos (Carril 2) | Der (Carril 3)',
+    guitar: 'Pista Izq (←) | Pista Centro (↑) | Pista Der (→)'
+  };
+  document.getElementById('lblActiveGameTitle').innerText = titles[type];
+  document.getElementById('lblGameHelp').innerText = helps[type];
+
+  canvas = document.getElementById('gameCanvas');
+  ctx = canvas.getContext('2d');
+
+  const diffMultiplier = parseFloat(document.getElementById('selDifficulty').value) || 1.4;
+
+  // Estado inicial del motor de juego
+  gameState = {
+    type: type,
+    score: 0,
+    lives: (type === 'car' || type === 'guitar') ? 3 : 1,
+    timeElapsed: 0,
+    maxTime: 45,
+    speed: diffMultiplier,
+    items: [],
+    particles: [],
+    lastSpawn: 0,
+    lastEmg: { L: false, R: false, both: false },
+    streak: 0,
+    reactionTimes: [],
+    moleState: 'WAIT',
+    moleHole: 1,
+    moleSpawnTime: 0,
+    nextMoleTime: Date.now() + 1000,
+    carLane: 1,
+    targetLane: 1,
+    feedbackText: '',
+    feedbackTimer: 0
+  };
+
+  clearInterval(gameInterval);
+  gameInterval = setInterval(() => {
+    if (!isPaused) gameState.timeElapsed++;
+  }, 1000);
+
+  runGameLoop();
+}
+
+function runGameLoop() {
+  if (!activeGame) return;
+
+  const w = canvas.width = canvas.parentNode.offsetWidth;
+  const h = canvas.height = canvas.parentNode.offsetHeight;
+
+  if (!isPaused) {
+    // 1. Limpieza y Fondo Estelar
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = '#191c2b';
+    ctx.fillRect(0, 0, w, h);
+
+    // Estrellas de fondo decorativas
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.fillRect(w * 0.15, h * 0.25, 2, 2);
+    ctx.fillRect(w * 0.85, h * 0.35, 3, 3);
+    ctx.fillRect(w * 0.45, h * 0.75, 2, 2);
+
+    // 2. Detección de Flanco de Activación Muscular
+    const threshL = activePatient ? activePatient.threshL : 1500;
+    const threshR = activePatient ? activePatient.threshR : 1500;
+    const isL = bleState.L.val >= threshL;
+    const isR = bleState.R.val >= threshR;
+    const isBoth = isL && isR;
+
+    const pulseBoth = isBoth && !gameState.lastEmg.both;
+    const pulseL = isL && !isR && !gameState.lastEmg.L;
+    const pulseR = isR && !isL && !gameState.lastEmg.R;
+    gameState.lastEmg = { L: isL, R: isR, both: isBoth };
+
+    // 3. Lógica específica del juego
+    // ══════════════════════════════════════════════
+    // JUEGO 1: GLOBOS
+    // ══════════════════════════════════════════════
+    if (gameState.type === 'balloons') {
+      const spawnInterval = 1400 / gameState.speed;
+      if (Date.now() - gameState.lastSpawn > spawnInterval) {
+        gameState.items.push({
+          x: w * (0.18 + Math.random() * 0.64),
+          y: h + 25,
+          side: Math.random() > 0.5 ? 'L' : 'R',
+          speed: (1.2 + Math.random() * 0.8) * gameState.speed,
+          color: Math.random() > 0.5 ? '#ff8fa3' : '#76ead7'
+        });
+        gameState.lastSpawn = Date.now();
+      }
+
+      // Procesar pulsos
+      if (pulseL || pulseR) {
+        const targetSide = pulseL ? 'L' : 'R';
+        let hitIdx = -1, lowestY = h;
+        gameState.items.forEach((b, idx) => {
+          if (b.side === targetSide && b.y < lowestY) {
+            lowestY = b.y; hitIdx = idx;
+          }
+        });
+        if (hitIdx !== -1) {
+          const hitB = gameState.items[hitIdx];
+          gameState.score += 25;
+          gameState.streak++;
+          playSound('pop');
+          spawnParticles(hitB.x, hitB.y, hitB.color);
+          gameState.items.splice(hitIdx, 1);
+        }
+      }
+
+      // Renderizar y mover globos
+      gameState.items = gameState.items.filter(b => {
+        b.y -= b.speed;
+        // Dibujo del globo
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, 24, 0, Math.PI * 2);
+        ctx.fillStyle = b.color; ctx.fill();
+        ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.stroke();
+
+        ctx.fillStyle = '#2e4740'; ctx.font = 'bold 16px Fredoka, sans-serif';
+        ctx.textAlign = 'center'; ctx.fillText(b.side, b.x, b.y + 6);
+
+        if (b.y < 10) {
+          gameState.streak = 0;
+          return false;
+        }
+        return true;
+      });
+
+      renderHUD(w, h, `Score: 🏆 ${gameState.score}`, `Tiempo: ⏱️ ${Math.max(0, gameState.maxTime - gameState.timeElapsed)}s`);
+      if (gameState.timeElapsed >= gameState.maxTime) return finishGame('Estallido de Globos');
+    }
+
+    // ══════════════════════════════════════════════
+    // JUEGO 2: PEAGALE AL TOPO
+    // ══════════════════════════════════════════════
+    else if (gameState.type === 'reaction') {
+      const holes = [w * 0.22, w * 0.5, w * 0.78];
+      // Dibujar madrigueras
+      holes.forEach(hx => {
+        ctx.beginPath(); ctx.ellipse(hx, h / 2 + 30, 45, 18, 0, 0, Math.PI * 2);
+        ctx.fillStyle = '#2c314a'; ctx.fill();
+      });
+
+      if (gameState.moleState === 'WAIT') {
+        ctx.fillStyle = '#ccd0e1'; ctx.font = '16px Fredoka, sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText('⏳ ¡Esperá al topo...!', w / 2, h / 2 - 35);
+        if (Date.now() >= gameState.nextMoleTime) {
+          gameState.moleState = 'UP';
+          gameState.moleHole = Math.floor(Math.random() * 3);
+          gameState.moleSpawnTime = Date.now();
+        }
+      } else {
+        // Topo visible
+        ctx.font = '48px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText('🐹', holes[gameState.moleHole], h / 2 + 25);
+
+        const moleTimeout = 2800 / gameState.speed;
+        if (Date.now() - gameState.moleSpawnTime > moleTimeout) {
+          gameState.moleState = 'WAIT';
+          gameState.nextMoleTime = Date.now() + 1200;
+        }
+
+        let pressedHole = -1;
+        if (pulseL) pressedHole = 0;
+        else if (pulseBoth) pressedHole = 1;
+        else if (pulseR) pressedHole = 2;
+
+        if (pressedHole !== -1) {
+          if (pressedHole === gameState.moleHole) {
+            const rt = Date.now() - gameState.moleSpawnTime;
+            gameState.reactionTimes.push(rt);
+            const pts = Math.max(20, Math.round(200 - (rt / 8)));
+            gameState.score += pts;
+            playSound('hit');
+            spawnParticles(holes[gameState.moleHole], h / 2, '#ffdfa7');
+            gameState.moleState = 'WAIT';
+            gameState.nextMoleTime = Date.now() + 1000;
+          }
+        }
+      }
+
+      renderHUD(w, h, `Score: 🏆 ${gameState.score}`, `Tiempo: ⏱️ ${Math.max(0, gameState.maxTime - gameState.timeElapsed)}s`);
+      if (gameState.timeElapsed >= gameState.maxTime) return finishGame('Pegale al Topo');
+    }
+
+    // ══════════════════════════════════════════════
+    // JUEGO 3: SÚPER AUTO VIRTUAL
+    // ══════════════════════════════════════════════
+    else if (gameState.type === 'car') {
+      if (pulseBoth) gameState.targetLane = 1;
+      else if (pulseL) gameState.targetLane = 0;
+      else if (pulseR) gameState.targetLane = 2;
+
+      gameState.carLane += (gameState.targetLane - gameState.carLane) * 0.22;
+      const lanes = [w * 0.22, w * 0.5, w * 0.78];
+
+      // Dibujar carretera
+      ctx.strokeStyle = 'rgba(255,255,255,0.15)'; ctx.lineWidth = 3; ctx.setLineDash([15, 15]);
+      ctx.beginPath(); ctx.moveTo(w * 0.36, 0); ctx.lineTo(w * 0.36, h); ctx.moveTo(w * 0.64, 0); ctx.lineTo(w * 0.64, h); ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Spawning de obstáculos y monedas
+      if (Date.now() - gameState.lastSpawn > (1400 / gameState.speed)) {
+        gameState.items.push({
+          lane: Math.floor(Math.random() * 3),
+          y: -25,
+          type: Math.random() > 0.4 ? 'coin' : 'obs',
+          speed: (2.5 + Math.random() * 0.8) * gameState.speed
+        });
+        gameState.lastSpawn = Date.now();
+      }
+
+      const playerX = lanes[0] + (lanes[2] - lanes[0]) * (gameState.carLane / 2);
+      
+      gameState.items = gameState.items.filter(item => {
+        item.y += item.speed;
+        ctx.font = '28px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText(item.type === 'coin' ? '⭐' : '👾', lanes[item.lane], item.y);
+
+        // Colisión con el auto
+        if (Math.abs(playerX - lanes[item.lane]) < 35 && Math.abs(h - 55 - item.y) < 26) {
+          if (item.type === 'coin') {
+            gameState.score += 30; playSound('coin');
+            spawnParticles(lanes[item.lane], item.y, '#ffd54f');
+          } else {
+            gameState.lives--; playSound('hit');
+            spawnParticles(lanes[item.lane], item.y, '#ff8fa3');
+          }
+          return false;
+        }
+        return item.y < h + 25;
+      });
+
+      // Dibujar auto del jugador
+      ctx.font = '40px sans-serif'; ctx.textAlign = 'center';
+      ctx.fillText('🏎️', playerX, h - 45);
+
+      renderHUD(w, h, `Score: 🏆 ${gameState.score}`, `Vidas: ${'❤️'.repeat(Math.max(0, gameState.lives))}`);
+      if (gameState.lives <= 0 || gameState.timeElapsed >= gameState.maxTime) return finishGame('Súper Auto Adaptado');
+    }
+
+    // ══════════════════════════════════════════════
+    // JUEGO 4: ESTRELLA DE ROCK
+    // ══════════════════════════════════════════════
+    else if (gameState.type === 'guitar') {
+      const frets = [w * 0.25, w * 0.5, w * 0.75];
+      const targetY = h - 50;
+
+      // Pistas de guitarra
+      frets.forEach((fx, i) => {
+        ctx.strokeStyle = 'rgba(255,255,255,0.15)'; ctx.lineWidth = 3;
+        ctx.beginPath(); ctx.moveTo(fx, 0); ctx.lineTo(fx, h); ctx.stroke();
+        ctx.beginPath(); ctx.arc(fx, targetY, 20, 0, Math.PI * 2);
+        ctx.strokeStyle = i === 0 ? '#ff8fa3' : i === 1 ? '#ffd54f' : '#76ead7';
+        ctx.lineWidth = 3; ctx.stroke();
+      });
+
+      if (Date.now() - gameState.lastSpawn > (1100 / gameState.speed)) {
+        gameState.items.push({
+          lane: Math.floor(Math.random() * 3),
+          y: -20,
+          speed: (3.2 + Math.random() * 0.5) * gameState.speed
+        });
+        gameState.lastSpawn = Date.now();
+      }
+
+      let activeFret = -1;
+      if (pulseL) { activeFret = 0; playSound('noteL'); }
+      else if (pulseBoth) { activeFret = 1; playSound('noteBoth'); }
+      else if (pulseR) { activeFret = 2; playSound('noteR'); }
+
+      gameState.items = gameState.items.filter(n => {
+        n.y += n.speed;
+        const color = n.lane === 0 ? '#ff8fa3' : n.lane === 1 ? '#ffd54f' : '#76ead7';
+        ctx.beginPath(); ctx.arc(frets[n.lane], n.y, 16, 0, Math.PI * 2);
+        ctx.fillStyle = color; ctx.fill();
+
+        if (activeFret === n.lane) {
+          const dist = Math.abs(n.y - targetY);
+          if (dist < 22) {
+            gameState.score += 50; gameState.streak++;
+            spawnParticles(frets[n.lane], targetY, color);
+            return false;
+          }
+        }
+        if (n.y > h - 10) {
+          gameState.streak = 0;
+          gameState.lives--;
+          return false;
+        }
+        return true;
+      });
+
+      renderHUD(w, h, `Score: 🏆 ${gameState.score} (x${gameState.streak})`, `Vidas: ${'❤️'.repeat(Math.max(0, gameState.lives))}`);
+      if (gameState.lives <= 0 || gameState.timeElapsed >= gameState.maxTime) return finishGame('Estrella de Rock');
+    }
+
+    // 4. Renderizar partículas
+    renderParticles();
+  }
+
+  animFrameId = requestAnimationFrame(runGameLoop);
+}
+
+function spawnParticles(x, y, color) {
+  for (let i = 0; i < 12; i++) {
+    gameState.particles.push({
+      x, y,
+      vx: (Math.random() - 0.5) * 6,
+      vy: (Math.random() - 0.5) * 6,
+      alpha: 1.0,
+      color: color
+    });
+  }
+}
+
+function renderParticles() {
+  gameState.particles = gameState.particles.filter(p => {
+    p.x += p.vx; p.y += p.vy;
+    p.alpha -= 0.04;
+    if (p.alpha <= 0) return false;
+    ctx.beginPath(); ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = p.color; ctx.globalAlpha = p.alpha;
+    ctx.fill(); ctx.globalAlpha = 1.0;
+    return true;
+  });
+}
+
+function renderHUD(w, h, textL, textR) {
+  ctx.fillStyle = '#ffffff'; ctx.font = 'bold 13px Fredoka, sans-serif';
+  ctx.textAlign = 'left'; ctx.fillText(textL, 12, 22);
+  ctx.textAlign = 'right'; ctx.fillText(textR, w - 12, 22);
+}
+
+function togglePauseGame() {
+  isPaused = !isPaused;
+  document.getElementById('btnPauseGame').innerText = isPaused ? '▶️' : '⏸️';
+}
+
+function stopGame(userCancelled) {
+  cancelAnimationFrame(animFrameId);
+  clearInterval(gameInterval);
+  activeGame = null;
+  document.getElementById('boxGameActive').classList.add('hidden');
+  document.getElementById('boxGameMenu').classList.remove('hidden');
+}
+
+function finishGame(gameName) {
+  cancelAnimationFrame(animFrameId);
+  clearInterval(gameInterval);
+  activeGame = null;
+  playSound('win');
+
+  const score = gameState.score;
+  const d = new Date();
+  const dateStr = `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}`;
+  
+  const sessionRecord = {
+    date: dateStr,
+    game: gameName,
+    score: score
+  };
+
+  if (gameState.reactionTimes && gameState.reactionTimes.length > 0) {
+    const avg = Math.round(gameState.reactionTimes.reduce((a,b)=>a+b,0) / gameState.reactionTimes.length);
+    sessionRecord.avgRt = avg;
+  }
+
+  activePatient.sessions.unshift(sessionRecord);
+  savePatients();
+
+  alert(`🎉 ¡Excelente trabajo, ${activePatient.name.split(' ')[0]}!\n\nJuego: ${gameName}\nPuntaje: ${score} Puntos`);
+
+  document.getElementById('boxGameActive').classList.add('hidden');
+  document.getElementById('boxGameMenu').classList.remove('hidden');
+  renderHistory();
+}
+
+function renderHistory() {
+  const container = document.getElementById('patientHistoryContainer');
+  if (!container || !activePatient) return;
+  container.innerHTML = '';
+
+  if (activePatient.sessions.length === 0) {
+    container.innerHTML = `<div style="background:#fff; border:2px dashed var(--border-color); border-radius:14px; padding:18px; text-align:center; color:#999; font-size:13px;">¡Todavía no hay partidas jugadas!</div>`;
+    return;
+  }
+
+  activePatient.sessions.slice(0, 5).forEach(s => {
+    container.innerHTML += `
+      <div class="history-card">
+        <div>
+          <b>⭐ ${s.game}</b>
+          <div style="font-size:11px; color:#999;">${s.date}</div>
+        </div>
+        <div style="color:var(--primary); font-weight:700; font-size:15px;">
+          ${s.score} Pts ${s.avgRt ? `<span style="font-size:10px; color:var(--secondary);">(${s.avgRt}ms)</span>` : ''}
+        </div>
+      </div>
+    `;
+  });
+}
+
+/* ══════════════════════════════════════════════════════════
+   NAVEGACIÓN DE PANTALLAS Y PESTAÑAS
+══════════════════════════════════════════════════════════ */
+function navTo(screenId) {
+  document.querySelectorAll('.screen, .app-layout').forEach(el => el.classList.add('hidden'));
+  document.getElementById(screenId).classList.remove('hidden');
+}
+
+function switchAppTab(tab) {
+  document.getElementById('viewGames').classList.toggle('hidden', tab !== 'games');
+  document.getElementById('viewAuto').classList.toggle('hidden', tab !== 'auto');
+  document.getElementById('viewSettings').classList.toggle('hidden', tab !== 'settings');
+
+  document.getElementById('navBtnGames').classList.toggle('active', tab === 'games');
+  document.getElementById('navBtnAuto').classList.toggle('active', tab === 'auto');
+  document.getElementById('navBtnSettings').classList.toggle('active', tab === 'settings');
+
+  if (tab === 'auto') {
+    currentAppMode = 'auto';
+    safeWriteBLE(bleState.L.char, 'MODE:AUTO');
+    safeWriteBLE(bleState.R.char, 'MODE:AUTO');
+  } else if (tab === 'games') {
+    currentAppMode = 'games';
+    safeWriteBLE(bleState.L.char, 'MODE:GAMES');
+    safeWriteBLE(bleState.R.char, 'MODE:GAMES');
+  }
+}
+
+function updateSettingsUI() {
+  const pInfo = document.getElementById('settingsPatientInfo');
+  if (pInfo && activePatient) {
+    pInfo.innerHTML = `
+      <b>Nombre:</b> ${activePatient.name}<br>
+      <b>Diagnóstico:</b> ${activePatient.diag}<br>
+      <b>Umbral Izquierdo:</b> ${activePatient.threshL || '--'}<br>
+      <b>Umbral Derecho:</b> ${activePatient.threshR || '--'}
+    `;
+  }
+  const bleEl = document.getElementById('settingsBleStatus');
+  if (bleEl) {
+    bleEl.innerHTML = `
+      <b>Brazo Izquierdo:</b> ${bleState.L.connected ? '✅ Conectado' : '❌ Desconectado'}<br>
+      <b>Brazo Derecho:</b> ${bleState.R.connected ? '✅ Conectado' : '❌ Desconectado'}<br>
+      <b>Auto RC:</b> ${bleState.CAR.connected ? '✅ Conectado' : '⚪ No vinculado'}
+    `;
+  }
+  // Cargar sliders con los umbrales del paciente activo
+  updateSettingsSensitivity();
+}
+
+// Simulador con teclado (← Izquierda, → Derecha, ↑ Ambos)
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowLeft')  bleState.L.val = 3200;
+  if (e.key === 'ArrowRight') bleState.R.val = 3200;
+  if (e.key === 'ArrowUp')   { bleState.L.val = 3200; bleState.R.val = 3200; }
+  onEMGDataReceived('L', bleState.L.val);
+  onEMGDataReceived('R', bleState.R.val);
+});
+window.addEventListener('keyup', (e) => {
+  if (e.key === 'ArrowLeft')  bleState.L.val = 150;
+  if (e.key === 'ArrowRight') bleState.R.val = 150;
+  if (e.key === 'ArrowUp')   { bleState.L.val = 150; bleState.R.val = 150; }
+  onEMGDataReceived('L', bleState.L.val);
+  onEMGDataReceived('R', bleState.R.val);
+});
+
+// Inicialización
+renderPatientList();
+</script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

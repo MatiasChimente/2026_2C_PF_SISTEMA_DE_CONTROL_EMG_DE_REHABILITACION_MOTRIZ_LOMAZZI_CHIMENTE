@@ -444,7 +444,7 @@ framework = arduino
 board_build.partitions = min_spiffs.csv
 //
 
-
+#include <Arduino.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
@@ -486,6 +486,7 @@ volatile unsigned long lastLeftPacket = 0;
 volatile unsigned long lastRightPacket = 0;
 
 BLEServer* pServer = NULL;
+BLECharacteristic* pCharacteristic = NULL;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
 String lastBleCmd = "STOP";
@@ -648,9 +649,6 @@ void loop() {
 
   delay(10);
 }
-
-
-
 
 
 
